@@ -761,6 +761,10 @@ static esp_err_t logs_handler(httpd_req_t *req)
 	file_logs_flush();
 	httpd_resp_set_type(req, "text/plain");
 
+	// Defers rotation while we hold the files open: littlefs cannot
+	// rename/unlink a file with an open FD
+	bool read_guarded = file_logs_read_begin();
+
 	for (int i = 0; i < 2; i++)
 	{
 		FILE *f = fopen(log_paths[i], "r");
@@ -774,6 +778,10 @@ static esp_err_t logs_handler(httpd_req_t *req)
 			if (httpd_resp_send_chunk(req, chunk, n) != ESP_OK)
 			{
 				fclose(f);
+				if (read_guarded)
+				{
+					file_logs_read_end();
+				}
 				httpd_resp_send_chunk(req, NULL, 0);
 				return ESP_FAIL;
 			}
@@ -781,6 +789,10 @@ static esp_err_t logs_handler(httpd_req_t *req)
 		fclose(f);
 	}
 
+	if (read_guarded)
+	{
+		file_logs_read_end();
+	}
 	httpd_resp_send_chunk(req, NULL, 0);
 	return ESP_OK;
 }
