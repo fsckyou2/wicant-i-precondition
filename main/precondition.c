@@ -1,9 +1,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
-#include "esp_timer.h"
 #include "esp_log.h"
 #include "can.h"
+#include "hsm.h"
 #include "precondition.h"
 #include "config_server.h"
 #include "freertos/FreeRTOS.h"
@@ -42,35 +42,7 @@ static void set_0x4e8_distance_flag(twai_message_t *packet, uint16_t distance_in
     packet->data[6] = (packet->data[6] & 0xF0U) | (flag & 0xFU);
 }
 
-// ********************* precondition logic *********************
-
-// is the user currently requesting preconditioning to be active?
-static bool precondition_requested = false;
-// timestamp of when the user requested preconditioning
-static int64_t precondition_requested_ts = 0U;
-// timestamp of last attempt to send precondition message, used for retry logic
-static int64_t precondition_last_attempt_ts = 0U;
-// number of ticks remaining to send precondition start/stop messages, used for initial burst logic
-static uint8_t precondition_start_ticks_remaining = 0U;
-static uint8_t precondition_stop_ticks_remaining = 0U;
-// number of times we've retried sending precondition messages, used for retry logic
-static uint8_t precondition_retries = 0U;
-// has preconditioning been confirmed to be starting by the status frame?
-static bool precondition_starting_confirmed = false;
-// has preconditioning been confirmed to be active by the status frame?
-static bool precondition_started_confirmed = false;
-// has precondition stop been confirmed by the status frame?
-static bool precondition_stop_confirmed = true;
-// track previous state of activation button for edge detection
-static bool activation_button_state_prev = false;
-// timestamp of the activation button press edge, for short/long press detection
-static int64_t activation_press_start_ts = 0U;
-// has the current hold already triggered? (long press mode fires once per hold)
-static bool activation_long_press_fired = false;
-// is the status frame available? false if on unknown platform, true if we at any point receive a known status frame
-static bool status_frame_available = false;
-
-static QueueHandle_t battery_temperature_queue = NULL;
+// ********************* activation buttons *********************
 
 typedef enum {
     // frame carries the current button state: pressed while (byte & mask) == value
@@ -161,6 +133,8 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
     return false;
 }
 
+// ********************* frame ids and timing constants *********************
+
 // 0x2AD on Ioniq 5/EV6, 0x0A82AA03 on Ioniq 6
 #define IS_STATUS_FRAME(frame_id) \
     ((frame_id) == 0x2ADU || (frame_id) == 0x0A82AA03U)
@@ -203,138 +177,73 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
     (((elapsed) >= PRECONDITION_RETRY_US) ? 0U : \
      ((PRECONDITION_RETRY_US - (elapsed)) / 1000000U))
 
-static int64_t now_us(void) {
-    return esp_timer_get_time();
-}
-
 static int64_t ts_elapsed(int64_t now, int64_t old) {
     return now - old;
 }
 
-void precondition_init(void) {
-    battery_temperature_queue = xQueueCreate(1, sizeof(precondition_temperature_t));
-    configASSERT(battery_temperature_queue != NULL);
-}
+// ********************* state machine outline *********************
+//
+// IDLE                       TOGGLE -> REQUESTED
+// REQUESTED                  enter: retries=0, status_seen=NONE
+// |                          fwd: block 0x0C7, MITM 0x4ED
+// |                          TOGGLE (debounced) -> STOPPING
+// +- START_BURST (initial)   3 ticks of 4003 then 3 of E007; on completion,
+// |                          route by the status seen during the burst
+// +- WAIT_STARTING           STATUS_STARTING -> WAIT_STARTED; retry every 10s
+// +- WAIT_STARTED            STATUS_STARTED -> ACTIVE; retry every 70s
+// +- ACTIVE                  STATUS_STARTING -> WAIT_STARTED (downgrade)
+//                            STATUS_IDLE -> "complete": stop (once mode) or idle
+// STOPPING                   TOGGLE -> REQUESTED (restart)
+// +- STOP_BURST (initial)    3 ticks of 0000 then 3 of E007; stop confirmation
+// |                          deliberately doesn't count until the burst is done
+// +- WAIT_STOPPED            STATUS_IDLE -> IDLE; retry every 10s
+//
+// the START/STOP_BURST leaves display the 0x4E8 countdown/retry status via
+// their fwd handlers, as do the WAIT_* leaves; ACTIVE and IDLE display nothing.
+// button decoding, the status-frame-to-event translation, and battery
+// temperature capture run unconditionally as global hooks.
 
-static void send_precondition_start_msg(uint8_t ticks_remaining) {
-    twai_message_t packet = {0};
-    packet.identifier = 0x0C7U;
-    packet.data_length_code = 8U;
-    if (ticks_remaining > PRECONDITION_START_PHASE2_TICKS) {
-        // send 0000004003000000 to 0x0C7
-        packet.data[3] = 0x40U;
-        packet.data[4] = 0x03U;
-    } else {
-        // send 000000E007000000 to 0x0C7
-        packet.data[3] = 0xE0U;
-        packet.data[4] = 0x07U;
-    }
-    // TODO(ejones): ensure that blocking for 1 tick is the right move here and elsewhere
-    can_send(CAR_BUS, &packet, 1);
-}
+enum {
+    EV_TOGGLE,          // activation input fired (short press release / long press hold)
+    EV_STATUS_IDLE,     // car reports preconditioning off/idle
+    EV_STATUS_STARTING, // car reports preconditioning starting
+    EV_STATUS_STARTED,  // car reports preconditioning fully running
+};
 
-static void send_precondition_stop_msg(uint8_t ticks_remaining) {
-    twai_message_t packet = {0};
-    packet.identifier = 0x0C7U;
-    packet.data_length_code = 8U;
-    if (ticks_remaining <= PRECONDITION_STOP_PHASE2_TICKS) {
-        // send 000000E007000000 to 0x0C7
-        packet.data[3] = 0xE0U;
-        packet.data[4] = 0x07U;
-    }
-    can_send(CAR_BUS, &packet, 1);
-}
+static const sm_state_t S_IDLE, S_REQUESTED, S_START_BURST, S_WAIT_STARTING,
+                        S_WAIT_STARTED, S_ACTIVE, S_STOPPING, S_STOP_BURST,
+                        S_WAIT_STOPPED;
 
-// Decide whether to block, modify, or passthrough a message for preconditioning.
-// Modifies packet data in-place when returning FWD_MODIFIED.
-// On single-bus builds only FWD_MODIFIED has an effect (FWD_BLOCK can't pull a
-// frame that's already on the wire); on multi-bus builds the caller bridges,
-// so FWD_BLOCK and FWD_PASSTHROUGH matter too. fwd_bus is the destination bus.
-fwd_result_t precondition_fwd_hook(twai_message_t *to_send, can_bus_t fwd_bus) {
-    // block 0x0C7 message so that the head unit doesn't turn off preconditioning on us
-    if (precondition_requested && to_send->identifier == 0x0C7U && fwd_bus == CAR_BUS) {
-        return FWD_BLOCK;
-    }
+static sm_t precon_sm;
 
-    // MITM 0x4ED message while preconditioning is requested
-    if (precondition_requested && to_send->identifier == 0x4EDU && fwd_bus == CAR_BUS) {
-        to_send->data[5] = 0x10U;
-        to_send->data[6] = 0xA0U;
-        to_send->data[7] = 0x00U;
-        return FWD_MODIFIED;
-    }
+// ********************* state machine context *********************
+// data shared across states; everything else that used to be a flag here is
+// now represented by which state the machine is in
 
-    // we are currently starting preconditioning and want to display the countdown flag.
-    if (precondition_requested && !precondition_started_confirmed && fwd_bus == CAR_BUS) {
-        int64_t now = now_us();
-        int64_t time_since_last_attempt = ts_elapsed(now, precondition_last_attempt_ts);
-        if (to_send->identifier == 0x4E8U) {
-            // i'm sorry for the nested ternary operators. i don't feel like fixing it right now
-            set_0x4e8_distance_flag(
-                to_send,
-                SECONDS_UNTIL_START(time_since_last_attempt),
-                // display retry count in tenths digit
-                status_frame_available ? (precondition_retries % 10) : 0,
-                status_frame_available ? (precondition_retries == 0 ? DIST_UNIT_YD : DIST_UNIT_KM) : DIST_UNIT_M,
-                // switch to destination flag after we get 05 for 2AD
-                status_frame_available ? (precondition_starting_confirmed ? FLAG_DESTINATION : FLAG_BLUE_1) : FLAG_BLUE_4
-            );
-            return FWD_MODIFIED;
-        }
+// is the status frame available? false if on unknown platform, true if we at any point receive a known status frame
+static bool status_frame_available = false;
+// timestamp of the start of the most recent start/stop burst, used for retry timing and the countdown display
+static int64_t last_attempt_ts = 0;
+// number of times we've re-sent the start (or stop) burst within the current request/stop
+static uint8_t retries = 0U;
+// highest precondition status the car has reported during the current request
+typedef enum {
+    STATUS_SEEN_NONE = 0,
+    STATUS_SEEN_STARTING,
+    STATUS_SEEN_STARTED,
+} status_seen_t;
+static status_seen_t status_seen = STATUS_SEEN_NONE;
 
-        if (to_send->identifier == 0x4CCU) {
-            to_send->data[0] = 0x02U;
-            return FWD_MODIFIED;
-        }
-    }
+// track previous state of activation button for edge detection
+static bool activation_button_state_prev = false;
+// timestamp of the activation button press edge, for short/long press detection
+static int64_t activation_press_start_ts = 0U;
+// has the current hold already triggered? (long press mode fires once per hold)
+static bool activation_long_press_fired = false;
 
-    // we are currently trying to stop preconditioning and want to display the retry status.
-    if (!precondition_requested
-            && status_frame_available
-            && !precondition_stop_confirmed
-            && precondition_retries < PRECONDITION_MAX_RETRIES
-            && fwd_bus == CAR_BUS) {
-        int64_t now = now_us();
-        int64_t time_since_last_attempt = ts_elapsed(now, precondition_last_attempt_ts);
-        if (to_send->identifier == 0x4E8U) {
-            set_0x4e8_distance_flag(
-                to_send,
-                SECONDS_UNTIL_STOP_RETRY(time_since_last_attempt),
-                // display retry count in tenths digit
-                precondition_retries % 10,
-                precondition_retries == 0 ? DIST_UNIT_FT : DIST_UNIT_MI,
-                FLAG_NONE
-            );
-            return FWD_MODIFIED;
-        }
+static QueueHandle_t battery_temperature_queue = NULL;
 
-        if (to_send->identifier == 0x4CCU) {
-            to_send->data[0] = 0x02U;
-            return FWD_MODIFIED;
-        }
-    }
-
-    // otherwise, passthrough without modification
-    return FWD_PASSTHROUGH;
-}
-
-static void start_preconditioning(int64_t now) {
-    precondition_requested = true;
-    precondition_requested_ts = now;
-    precondition_last_attempt_ts = now;
-    precondition_start_ticks_remaining = PRECONDITION_START_TICKS;
-    precondition_starting_confirmed = false;
-    precondition_started_confirmed = false;
-    precondition_retries = 0U;
-}
-
-static void stop_preconditioning(int64_t now) {
-    precondition_requested = false;
-    precondition_last_attempt_ts = now;
-    precondition_stop_ticks_remaining = PRECONDITION_STOP_TICKS;
-    precondition_stop_confirmed = false;
-    precondition_retries = 0U;
-}
+// ********************* config caches *********************
 
 // Cache the configured activation button type. A config change restarts the
 // whole firmware, so the value is effectively constant for the lifetime of
@@ -360,17 +269,437 @@ static int8_t cached_precon_press_type(void) {
     return precon_press_type;
 }
 
-// toggle preconditioning on an activation event, with debounce between start and stop
-static void toggle_preconditioning(void) {
-    int64_t now = now_us();
-    if (!precondition_requested) {
-        start_preconditioning(now);
-    } else if (ts_elapsed(now, precondition_requested_ts) > PRECONDITION_DEBOUNCE_US) {
-        stop_preconditioning(now);
+// ********************* CAN tx helpers *********************
+
+// burst_tick counts up from 0 within the burst
+static void send_precondition_start_msg(uint32_t burst_tick) {
+    twai_message_t packet = {0};
+    packet.identifier = 0x0C7U;
+    packet.data_length_code = 8U;
+    if (burst_tick < PRECONDITION_START_PHASE1_TICKS) {
+        // send 0000004003000000 to 0x0C7
+        packet.data[3] = 0x40U;
+        packet.data[4] = 0x03U;
+    } else {
+        // send 000000E007000000 to 0x0C7
+        packet.data[3] = 0xE0U;
+        packet.data[4] = 0x07U;
+    }
+    // TODO(ejones): ensure that blocking for 1 tick is the right move here and elsewhere
+    can_send(CAR_BUS, &packet, 1);
+}
+
+static void send_precondition_stop_msg(uint32_t burst_tick) {
+    twai_message_t packet = {0};
+    packet.identifier = 0x0C7U;
+    packet.data_length_code = 8U;
+    if (burst_tick >= PRECONDITION_STOP_PHASE1_TICKS) {
+        // send 000000E007000000 to 0x0C7 (phase 1 sends all-zero data)
+        packet.data[3] = 0xE0U;
+        packet.data[4] = 0x07U;
+    }
+    can_send(CAR_BUS, &packet, 1);
+}
+
+// ********************* shared state helpers *********************
+
+// enter the stop sequence. start_retries is 0 for a normal stop; passing
+// PRECONDITION_MAX_RETRIES makes it a single silent burst (no display, no
+// retries), which is how a failed start gives up.
+static void enter_stopping(sm_t *sm, uint8_t start_retries) {
+    retries = start_retries;
+    sm_transition(sm, &S_STOPPING);
+}
+
+// shared by both burst states: retry timers and countdown displays measure
+// from the moment the burst began
+static void burst_enter(sm_t *sm) {
+    last_attempt_ts = sm_now(sm);
+}
+
+// 0x4E8/0x4CC countdown display while a start is in flight
+// (shared by START_BURST, WAIT_STARTING, and WAIT_STARTED)
+static fwd_result_t starting_display_fwd(sm_t *sm, twai_message_t *to_send, can_bus_t fwd_bus) {
+    // the display only runs until the car confirms preconditioning fully
+    // started, which can happen mid-burst, before we route to ACTIVE
+    if (status_seen == STATUS_SEEN_STARTED) {
+        return FWD_PASSTHROUGH;
+    }
+    if (to_send->identifier == 0x4E8U) {
+        int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), last_attempt_ts);
+        set_0x4e8_distance_flag(
+            to_send,
+            SECONDS_UNTIL_START(time_since_last_attempt),
+            // display retry count in tenths digit
+            status_frame_available ? (retries % 10U) : 0U,
+            status_frame_available ? (retries == 0U ? DIST_UNIT_YD : DIST_UNIT_KM) : DIST_UNIT_M,
+            // switch to the destination flag once the car confirms it's starting
+            status_frame_available ? (status_seen >= STATUS_SEEN_STARTING ? FLAG_DESTINATION : FLAG_BLUE_1) : FLAG_BLUE_4
+        );
+        return FWD_MODIFIED;
+    }
+    if (to_send->identifier == 0x4CCU) {
+        to_send->data[0] = 0x02U;
+        return FWD_MODIFIED;
+    }
+    return FWD_PASSTHROUGH;
+}
+
+// 0x4E8/0x4CC retry display while a stop is in flight
+// (shared by STOP_BURST and WAIT_STOPPED)
+static fwd_result_t stopping_display_fwd(sm_t *sm, twai_message_t *to_send, can_bus_t fwd_bus) {
+    // only display when we can actually confirm/retry the stop, and hide it
+    // once retries are exhausted (including the silent give-up stop)
+    if (!status_frame_available || retries >= PRECONDITION_MAX_RETRIES) {
+        return FWD_PASSTHROUGH;
+    }
+    if (to_send->identifier == 0x4E8U) {
+        int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), last_attempt_ts);
+        set_0x4e8_distance_flag(
+            to_send,
+            SECONDS_UNTIL_STOP_RETRY(time_since_last_attempt),
+            // display retry count in tenths digit
+            retries % 10U,
+            retries == 0U ? DIST_UNIT_FT : DIST_UNIT_MI,
+            FLAG_NONE
+        );
+        return FWD_MODIFIED;
+    }
+    if (to_send->identifier == 0x4CCU) {
+        to_send->data[0] = 0x02U;
+        return FWD_MODIFIED;
+    }
+    return FWD_PASSTHROUGH;
+}
+
+// ********************* IDLE *********************
+
+static bool idle_event(sm_t *sm, sm_event_t ev) {
+    if (ev == EV_TOGGLE) {
+        sm_transition(sm, &S_REQUESTED);
+        return true;
+    }
+    return false;
+}
+
+// ********************* REQUESTED (superstate) *********************
+
+static void requested_enter(sm_t *sm) {
+    retries = 0U;
+    status_seen = STATUS_SEEN_NONE;
+}
+
+static bool requested_event(sm_t *sm, sm_event_t ev) {
+    if (ev == EV_TOGGLE) {
+        // debounce between start and stop
+        if (sm_time_in_us(sm, &S_REQUESTED) > PRECONDITION_DEBOUNCE_US) {
+            enter_stopping(sm, 0U);
+        }
+        return true;
+    }
+    return false;
+}
+
+static fwd_result_t requested_fwd(sm_t *sm, twai_message_t *to_send, can_bus_t fwd_bus) {
+    // block 0x0C7 so that the head unit doesn't turn off preconditioning on us
+    if (to_send->identifier == 0x0C7U) {
+        return FWD_BLOCK;
+    }
+    // MITM 0x4ED while preconditioning is requested
+    if (to_send->identifier == 0x4EDU) {
+        to_send->data[5] = 0x10U;
+        to_send->data[6] = 0xA0U;
+        to_send->data[7] = 0x00U;
+        return FWD_MODIFIED;
+    }
+    return FWD_PASSTHROUGH;
+}
+
+// ********************* REQUESTED / START_BURST *********************
+
+static void start_burst_tick(sm_t *sm) {
+    uint32_t t = sm_ticks_in_state(sm);
+    send_precondition_start_msg(t);
+    if (t + 1U >= PRECONDITION_START_TICKS) {
+        // route by what the status frame told us during the burst
+        switch (status_seen) {
+            case STATUS_SEEN_STARTED:
+                sm_transition(sm, &S_ACTIVE);
+                break;
+            case STATUS_SEEN_STARTING:
+                sm_transition(sm, &S_WAIT_STARTED);
+                break;
+            default:
+                sm_transition(sm, &S_WAIT_STARTING);
+                break;
+        }
     }
 }
 
-void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
+static bool start_burst_event(sm_t *sm, sm_event_t ev) {
+    // record confirmations without cutting the burst short: the full burst
+    // (including the E007 phase) is always sent, and routing happens when it
+    // ends. TOGGLE falls through to REQUESTED.
+    switch (ev) {
+        case EV_STATUS_STARTING:
+            if (status_seen < STATUS_SEEN_STARTING) {
+                status_seen = STATUS_SEEN_STARTING;
+            }
+            return true;
+        case EV_STATUS_STARTED:
+            status_seen = STATUS_SEEN_STARTED;
+            return true;
+        case EV_STATUS_IDLE:
+            // expected while the start is still in flight
+            return true;
+    }
+    return false;
+}
+
+// ********************* REQUESTED / WAIT_STARTING *********************
+
+static void wait_starting_tick(sm_t *sm) {
+    int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), last_attempt_ts);
+    if (!status_frame_available) {
+        // without status frames we can't confirm or retry anything; after the
+        // timeout, assume it worked so the countdown display goes away
+        if (time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US) {
+            sm_transition(sm, &S_ACTIVE);
+        }
+        return;
+    }
+    if (time_since_last_attempt > PRECONDITION_RETRY_US) {
+        if (retries < PRECONDITION_MAX_RETRIES) {
+            retries++;
+            sm_transition(sm, &S_START_BURST);
+        } else {
+            // give up and send one silent stop attempt
+            enter_stopping(sm, PRECONDITION_MAX_RETRIES);
+        }
+    }
+}
+
+static bool wait_starting_event(sm_t *sm, sm_event_t ev) {
+    switch (ev) {
+        case EV_STATUS_STARTING:
+            status_seen = STATUS_SEEN_STARTING;
+            sm_transition(sm, &S_WAIT_STARTED);
+            return true;
+        case EV_STATUS_STARTED:
+            status_seen = STATUS_SEEN_STARTED;
+            sm_transition(sm, &S_ACTIVE);
+            return true;
+        case EV_STATUS_IDLE:
+            // expected while the start is still in flight
+            return true;
+    }
+    return false;
+}
+
+// ********************* REQUESTED / WAIT_STARTED *********************
+
+static void wait_started_tick(sm_t *sm) {
+    // the car said "starting" but hasn't reached fully started
+    // (i.e. we got 2AD 05 but not 15 after a long time)
+    int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), last_attempt_ts);
+    if (time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US) {
+        if (retries < PRECONDITION_MAX_RETRIES) {
+            retries++;
+            sm_transition(sm, &S_START_BURST);
+        } else {
+            enter_stopping(sm, PRECONDITION_MAX_RETRIES);
+        }
+    }
+}
+
+static bool wait_started_event(sm_t *sm, sm_event_t ev) {
+    switch (ev) {
+        case EV_STATUS_STARTED:
+            status_seen = STATUS_SEEN_STARTED;
+            sm_transition(sm, &S_ACTIVE);
+            return true;
+        case EV_STATUS_STARTING:
+        case EV_STATUS_IDLE:
+            // still starting; keep waiting
+            return true;
+    }
+    return false;
+}
+
+// ********************* REQUESTED / ACTIVE *********************
+
+static bool active_event(sm_t *sm, sm_event_t ev) {
+    switch (ev) {
+        case EV_STATUS_STARTED:
+            // steady state
+            return true;
+        case EV_STATUS_STARTING:
+            // preconditioning was previously fully active, but now it's only showing as starting.
+            // this is a weird situation to be in; let's just reset the current attempt time,
+            // and let the retry logic continue as normal if it doesn't resolve itself after a while
+            last_attempt_ts = sm_now(sm);
+            status_seen = STATUS_SEEN_STARTING;
+            sm_transition(sm, &S_WAIT_STARTED);
+            return true;
+        case EV_STATUS_IDLE:
+            // preconditioning was previously fully active, but now it's showing as off.
+            // it's possible that the car has reached the "Precondition complete" state.
+            // until we have a better way to distinguish that state from a real failure mode (TODO(ejones)),
+            // let's just assume everything is fine and reset our state
+            if (config_server_precon_mode() == ONCE) {
+                // in "once" mode, actually attempt to actively stop preconditioning.
+                // this should prevent preconditioning from restarting once the battery falls back below temp.
+                // TODO(ejones): this needs testing
+                enter_stopping(sm, 0U);
+            } else {
+                // TODO(ejones): continuous mode needs more development. for now,
+                // this just doesn't attempt to stop preconditoning and lets the BMU do what it wants
+                // once it reaches temp
+                sm_transition(sm, &S_IDLE);
+            }
+            return true;
+    }
+    return false;
+}
+
+// ********************* STOPPING (superstate) *********************
+
+static bool stopping_event(sm_t *sm, sm_event_t ev) {
+    if (ev == EV_TOGGLE) {
+        // activation while stopping restarts preconditioning
+        sm_transition(sm, &S_REQUESTED);
+        return true;
+    }
+    return false;
+}
+
+// ********************* STOPPING / STOP_BURST *********************
+
+static void stop_burst_tick(sm_t *sm) {
+    uint32_t t = sm_ticks_in_state(sm);
+    send_precondition_stop_msg(t);
+    if (t + 1U >= PRECONDITION_STOP_TICKS) {
+        // without status frames there's no confirmation or retry to wait for
+        sm_transition(sm, status_frame_available ? &S_WAIT_STOPPED : &S_IDLE);
+    }
+}
+
+static bool stop_burst_event(sm_t *sm, sm_event_t ev) {
+    if (ev == EV_STATUS_IDLE) {
+        // deliberately not treated as confirmation: the stop only counts as
+        // confirmed once the full burst has been sent
+        return true;
+    }
+    return false;
+}
+
+// ********************* STOPPING / WAIT_STOPPED *********************
+
+static void wait_stopped_tick(sm_t *sm) {
+    int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), last_attempt_ts);
+    if (time_since_last_attempt > PRECONDITION_RETRY_US) {
+        if (retries < PRECONDITION_MAX_RETRIES) {
+            retries++;
+            sm_transition(sm, &S_STOP_BURST);
+        } else {
+            // give up; the retry display is already hidden at max retries
+            sm_transition(sm, &S_IDLE);
+        }
+    }
+}
+
+static bool wait_stopped_event(sm_t *sm, sm_event_t ev) {
+    if (ev == EV_STATUS_IDLE) {
+        sm_transition(sm, &S_IDLE);
+        return true;
+    }
+    return false;
+}
+
+// ********************* state table *********************
+
+static const sm_state_t S_IDLE = {
+    .name = "idle",
+    .event = idle_event,
+};
+
+static const sm_state_t S_REQUESTED = {
+    .name = "requested",
+    .initial = &S_START_BURST,
+    .enter = requested_enter,
+    .event = requested_event,
+    .fwd = requested_fwd,
+};
+
+static const sm_state_t S_START_BURST = {
+    .name = "start-burst",
+    .parent = &S_REQUESTED,
+    .enter = burst_enter,
+    .tick = start_burst_tick,
+    .event = start_burst_event,
+    .fwd = starting_display_fwd,
+};
+
+static const sm_state_t S_WAIT_STARTING = {
+    .name = "wait-starting",
+    .parent = &S_REQUESTED,
+    .tick = wait_starting_tick,
+    .event = wait_starting_event,
+    .fwd = starting_display_fwd,
+};
+
+static const sm_state_t S_WAIT_STARTED = {
+    .name = "wait-started",
+    .parent = &S_REQUESTED,
+    .tick = wait_started_tick,
+    .event = wait_started_event,
+    .fwd = starting_display_fwd,
+};
+
+static const sm_state_t S_ACTIVE = {
+    .name = "active",
+    .parent = &S_REQUESTED,
+    .event = active_event,
+};
+
+static const sm_state_t S_STOPPING = {
+    .name = "stopping",
+    .initial = &S_STOP_BURST,
+    .event = stopping_event,
+};
+
+static const sm_state_t S_STOP_BURST = {
+    .name = "stop-burst",
+    .parent = &S_STOPPING,
+    .enter = burst_enter,
+    .tick = stop_burst_tick,
+    .event = stop_burst_event,
+    .fwd = stopping_display_fwd,
+};
+
+static const sm_state_t S_WAIT_STOPPED = {
+    .name = "wait-stopped",
+    .parent = &S_STOPPING,
+    .tick = wait_stopped_tick,
+    .event = wait_stopped_event,
+    .fwd = stopping_display_fwd,
+};
+
+// ********************* global input hooks *********************
+
+static void precondition_input_tick(sm_t *sm) {
+    // long press mode: trigger once when the hold crosses the threshold, without
+    // waiting for the release frame. state only becomes pressed via the rx hook,
+    // so this does nothing when the activation button is disabled
+    if (activation_button_state_prev && !activation_long_press_fired
+            && cached_precon_press_type() == PRESS_LONG
+            && ts_elapsed(sm_now(sm), activation_press_start_ts) >= PRECONDITION_LONG_PRESS_US) {
+        activation_long_press_fired = true;
+        sm_send_event(sm, EV_TOGGLE);
+    }
+}
+
+static void precondition_input_rx(sm_t *sm, const twai_message_t *to_push, can_bus_t rx_bus) {
     // 0x2AD/0x0A82AA03 status frame: second byte indicates precondition state
     //   Ioniq 5/6: 0x01 = off/idle, 0x05 = starting, 0x15 = fully running
     //   EV6: 0x41 = off/idle, 0x45 = starting, 0x55 = fully running
@@ -381,47 +710,12 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
         status_frame_available = true;
 
         uint8_t status = to_push->data[1];
-        if (precondition_requested && !precondition_starting_confirmed) {
-            if (STATUS_STARTING(status) || STATUS_STARTED(status)) {
-                precondition_starting_confirmed = true;
-            }
-        }
-        if (precondition_requested && !precondition_started_confirmed) {
-            if (STATUS_STARTED(status)) {
-                precondition_started_confirmed = true;
-            }
-        }
-        if (precondition_requested && precondition_started_confirmed) {
-            if (STATUS_STARTING(status)) {
-                // preconditioning was previously fully active, but now it's only showing as starting.
-                // this is a weird situation to be in; let's just reset the current attempt time,
-                // and let the retry logic continue as normal if it doesn't resolve itself after a while
-                precondition_last_attempt_ts = now_us();
-                precondition_started_confirmed = false;
-            }
-            if (STATUS_IDLE(status)) {
-                // preconditioning was previously fully active, but now it's showing as off.
-                // it's possible that the car has reached the "Precondition complete" state.
-                // until we have a better way to distinguish that state from a real failure mode (TODO(ejones)),
-                // let's just assume everything is fine and reset our state
-                int64_t now = now_us();
-                stop_preconditioning(now);
-                // if we are in "once" mode, actually attempt to actively stop preconditioning.
-                // this should prevent preconditioning from restarting once the battery falls back below temp.
-                // TODO(ejones): this needs testing
-                if(config_server_precon_mode() != ONCE) {
-                    // TODO(ejones): continuous mode needs more development. for now,
-                    // this just doesn't attempt to stop preconditoning and lets the BMU do what it wants
-                    // once it reaches temp
-                    precondition_stop_ticks_remaining = 0U;
-                    precondition_stop_confirmed = true;
-                }
-            }
-        }
-        if (!precondition_requested && !precondition_stop_confirmed && precondition_stop_ticks_remaining == 0U) {
-            if (STATUS_IDLE(status)) {
-                precondition_stop_confirmed = true;
-            }
+        if (STATUS_STARTED(status)) {
+            sm_send_event(sm, EV_STATUS_STARTED);
+        } else if (STATUS_STARTING(status)) {
+            sm_send_event(sm, EV_STATUS_STARTING);
+        } else if (STATUS_IDLE(status)) {
+            sm_send_event(sm, EV_STATUS_IDLE);
         }
     }
 
@@ -431,7 +725,7 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
         precondition_temperature_t temperature = {
             .min_c = to_push->data[BATTERY_TEMPERATURE_MIN_INDEX],
             .max_c = to_push->data[BATTERY_TEMPERATURE_MAX_INDEX],
-            .updated_at_us = esp_timer_get_time(),
+            .updated_at_us = sm_now(sm),
         };
 
         xQueueOverwrite(battery_temperature_queue, &temperature);
@@ -448,97 +742,57 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
     }
     // track activation button press/release edges. short press mode triggers on
     // the release edge if the hold stayed under the threshold; long press mode
-    // triggers from precondition_tick once the hold crosses the threshold
+    // triggers from the tick hook once the hold crosses the threshold
     const message_payload_t *button = &activation_messages[precon_button_type];
     if (activation_is_press(button, to_push)) {
         if (!activation_button_state_prev) {
-            activation_press_start_ts = now_us();
+            activation_press_start_ts = sm_now(sm);
             activation_long_press_fired = false;
         }
         activation_button_state_prev = true;
     } else if (activation_is_release(button, to_push)) {
         if (activation_button_state_prev
                 && cached_precon_press_type() == PRESS_SHORT
-                && ts_elapsed(now_us(), activation_press_start_ts) < PRECONDITION_LONG_PRESS_US) {
-            toggle_preconditioning();
+                && ts_elapsed(sm_now(sm), activation_press_start_ts) < PRECONDITION_LONG_PRESS_US) {
+            sm_send_event(sm, EV_TOGGLE);
         }
         activation_button_state_prev = false;
     }
+}
 
+static const sm_hooks_t precondition_hooks = {
+    .tick = precondition_input_tick,
+    .rx = precondition_input_rx,
+};
+
+// ********************* public API *********************
+
+void precondition_init(void) {
+    battery_temperature_queue = xQueueCreate(1, sizeof(precondition_temperature_t));
+    configASSERT(battery_temperature_queue != NULL);
+    sm_init(&precon_sm, "precondition", &S_IDLE, &precondition_hooks);
 }
 
 // called every 40ms
 void precondition_tick(void) {
-    int64_t now = now_us();
-    int64_t time_since_last_attempt = ts_elapsed(now, precondition_last_attempt_ts);
+    sm_tick(&precon_sm);
+}
 
-    // long press mode: trigger once when the hold crosses the threshold, without
-    // waiting for the release frame. state only becomes pressed via the rx hook,
-    // so this does nothing when the activation button is disabled
-    if (activation_button_state_prev && !activation_long_press_fired
-            && cached_precon_press_type() == PRESS_LONG
-            && ts_elapsed(now, activation_press_start_ts) >= PRECONDITION_LONG_PRESS_US) {
-        activation_long_press_fired = true;
-        toggle_preconditioning();
+void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
+    sm_rx(&precon_sm, to_push, rx_bus);
+}
+
+// Decide whether to block, modify, or passthrough a message for preconditioning.
+// Modifies packet data in-place when returning FWD_MODIFIED.
+// On single-bus builds only FWD_MODIFIED has an effect (FWD_BLOCK can't pull a
+// frame that's already on the wire); on multi-bus builds the caller bridges,
+// so FWD_BLOCK and FWD_PASSTHROUGH matter too. fwd_bus is the destination bus.
+fwd_result_t precondition_fwd_hook(twai_message_t *to_send, can_bus_t fwd_bus) {
+    // every rule targets frames headed for the car bus
+    if (fwd_bus != CAR_BUS) {
+        return FWD_PASSTHROUGH;
     }
-
-    // we can only do retry logic if we know the status frame
-    if (status_frame_available) {
-        // give up and send one stop attempt if start retries exhausted
-        if (precondition_requested
-                && precondition_start_ticks_remaining == 0U
-                && precondition_retries >= PRECONDITION_MAX_RETRIES
-                && ((!precondition_starting_confirmed && time_since_last_attempt > PRECONDITION_RETRY_US)
-                    || (!precondition_started_confirmed && time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US))) {
-            stop_preconditioning(now);
-            precondition_retries = PRECONDITION_MAX_RETRIES;  // don't retry the stop; this is a failure case already
-        }
-
-        // retry start if not confirmed to be starting yet and it's been long enough
-        if (precondition_requested && !precondition_starting_confirmed
-                && precondition_start_ticks_remaining == 0U
-                && precondition_retries < PRECONDITION_MAX_RETRIES
-                && time_since_last_attempt > PRECONDITION_RETRY_US) {
-            precondition_last_attempt_ts = now;
-            precondition_start_ticks_remaining = PRECONDITION_START_TICKS;
-            precondition_retries++;
-        }
-
-        // retry start if not confirmed to be started yet and it's been long enough (i.e. we got 2AD 05 but not 15 after a long time)
-        if (precondition_requested && !precondition_started_confirmed
-                && precondition_start_ticks_remaining == 0U
-                && precondition_retries < PRECONDITION_MAX_RETRIES
-                && time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US) {
-            precondition_last_attempt_ts = now;
-            precondition_start_ticks_remaining = PRECONDITION_START_TICKS;
-            precondition_retries++;
-        }
-
-        // retry stop if not confirmed
-        if (!precondition_requested && !precondition_stop_confirmed
-                && precondition_stop_ticks_remaining == 0U
-                && precondition_retries < PRECONDITION_MAX_RETRIES
-                && time_since_last_attempt > PRECONDITION_RETRY_US) {
-            precondition_last_attempt_ts = now;
-            precondition_stop_ticks_remaining = PRECONDITION_STOP_TICKS;
-            precondition_retries++;
-        }
-    } else if (precondition_requested && time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US) {
-        // if we don't have status messages, we still want to stop displaying the UI after 70 seconds
-        precondition_started_confirmed = true;
-    }
-
-    // send initial burst of start messages
-    if (precondition_requested && precondition_start_ticks_remaining > 0U) {
-        send_precondition_start_msg(precondition_start_ticks_remaining);
-        precondition_start_ticks_remaining--;
-    }
-
-    // send initial burst of stop messages
-    if (!precondition_requested && precondition_stop_ticks_remaining > 0U) {
-        send_precondition_stop_msg(precondition_stop_ticks_remaining);
-        precondition_stop_ticks_remaining--;
-    }
+    return sm_fwd(&precon_sm, to_send, fwd_bus);
 }
 
 bool precondition_get_battery_temperature(precondition_temperature_t *out) {
