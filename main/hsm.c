@@ -22,6 +22,18 @@ static int ancestor_path(const sm_state_t *s, const sm_state_t *path[SM_MAX_DEPT
     return n;
 }
 
+// zero the state's engine-managed context (if any), stamp its entry time,
+// and run its enter handler
+static void enter_state(sm_t *sm, const sm_state_t *s, int depth) {
+    if (s->ctx != NULL) {
+        memset(s->ctx, 0, s->ctx_size);
+    }
+    sm->entered_ts[depth] = sm->now;
+    if (s->enter != NULL) {
+        s->enter(sm);
+    }
+}
+
 static void do_transition(sm_t *sm, const sm_state_t *target) {
     const sm_state_t *src_path[SM_MAX_DEPTH];
     const sm_state_t *dst_path[SM_MAX_DEPTH];
@@ -48,10 +60,7 @@ static void do_transition(sm_t *sm, const sm_state_t *target) {
     }
 
     for (int i = keep; i < nd; i++) {
-        sm->entered_ts[i] = sm->now;
-        if (dst_path[i]->enter != NULL) {
-            dst_path[i]->enter(sm);
-        }
+        enter_state(sm, dst_path[i], i);
     }
 
     // descend through default children until we reach a leaf
@@ -59,10 +68,7 @@ static void do_transition(sm_t *sm, const sm_state_t *target) {
     int depth = nd;
     while (leaf->initial != NULL && depth < SM_MAX_DEPTH) {
         leaf = leaf->initial;
-        sm->entered_ts[depth] = sm->now;
-        if (leaf->enter != NULL) {
-            leaf->enter(sm);
-        }
+        enter_state(sm, leaf, depth);
         depth++;
     }
 
@@ -82,6 +88,8 @@ static bool apply_if_pending(sm_t *sm) {
     while (sm->pending != NULL && guard-- > 0) {
         const sm_state_t *target = sm->pending;
         sm->pending = NULL;
+        sm->entry_arg = sm->pending_arg;
+        sm->pending_arg = 0;
         do_transition(sm, target);
     }
     if (sm->pending != NULL) {
@@ -101,18 +109,12 @@ void sm_init(sm_t *sm, const char *tag, const sm_state_t *initial, const sm_hook
     const sm_state_t *path[SM_MAX_DEPTH];
     int n = ancestor_path(initial, path);
     for (int i = 0; i < n; i++) {
-        sm->entered_ts[i] = sm->now;
-        if (path[i]->enter != NULL) {
-            path[i]->enter(sm);
-        }
+        enter_state(sm, path[i], i);
     }
     const sm_state_t *leaf = initial;
     while (leaf->initial != NULL && n < SM_MAX_DEPTH) {
         leaf = leaf->initial;
-        sm->entered_ts[n] = sm->now;
-        if (leaf->enter != NULL) {
-            leaf->enter(sm);
-        }
+        enter_state(sm, leaf, n);
         n++;
     }
     sm->current = leaf;
@@ -206,11 +208,20 @@ void sm_send_event(sm_t *sm, sm_event_t ev) {
 }
 
 void sm_transition(sm_t *sm, const sm_state_t *target) {
+    sm_transition_arg(sm, target, 0);
+}
+
+void sm_transition_arg(sm_t *sm, const sm_state_t *target, intptr_t arg) {
     if (sm->pending != NULL && sm->pending != target) {
         ESP_LOGW(sm->tag, "overriding pending transition %s with %s",
                  sm->pending->name, target->name);
     }
     sm->pending = target;
+    sm->pending_arg = arg;
+}
+
+intptr_t sm_entry_arg(const sm_t *sm) {
+    return sm->entry_arg;
 }
 
 bool sm_in(const sm_t *sm, const sm_state_t *state) {

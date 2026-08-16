@@ -27,10 +27,22 @@
 // handlers may themselves call sm_transition; the engine applies it after the
 // in-progress transition completes.
 //
+// Per-state context: a state may declare a context struct via .ctx/.ctx_size.
+// The engine zeroes it whenever the state is entered from outside itself
+// (before its enter handler runs), so context owned by a state and its
+// descendants provably starts fresh each episode and is never stale across
+// visits. Transitions within the owning state's subtree leave it untouched.
+//
+// Entry arguments: sm_transition_arg() attaches one intptr_t to a transition;
+// the target's enter handlers read it via sm_entry_arg() — after the engine's
+// context zeroing, so presets survive. Plain sm_transition() passes 0. The
+// value is only meaningful inside enter handlers for that transition.
+//
 // Concurrency: the engine is not thread-safe. All calls into one sm_t must
 // come from a single task (for preconditioning, the CAN RX task).
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "driver/twai.h"
 #include "can.h"
@@ -55,6 +67,8 @@ struct sm_state {
     const char *name;          // used in transition logs
     const sm_state_t *parent;  // NULL for root-level states
     const sm_state_t *initial; // composite states: default child; NULL for leaves
+    void *ctx;                 // optional context zeroed by the engine on entry
+    size_t ctx_size;
     void (*enter)(sm_t *sm);
     void (*exit)(sm_t *sm);
     void (*tick)(sm_t *sm);
@@ -77,6 +91,8 @@ struct sm {
     const sm_state_t *current;     // always a leaf; NULL until sm_init
     const sm_hooks_t *global;
     const sm_state_t *pending;     // transition requested during dispatch
+    intptr_t pending_arg;          // entry argument for the pending transition
+    intptr_t entry_arg;            // entry argument of the transition being applied
     int64_t now;                   // timestamp of the dispatch in progress
     int64_t entered_ts[SM_MAX_DEPTH]; // entry time per depth (0 = outermost)
     uint32_t leaf_ticks;           // completed tick dispatches since leaf entry
@@ -89,6 +105,12 @@ fwd_result_t sm_fwd(sm_t *sm, twai_message_t *msg, can_bus_t bus);
 void sm_send_event(sm_t *sm, sm_event_t ev);
 // request a transition; applied when the current handler returns (see above)
 void sm_transition(sm_t *sm, const sm_state_t *target);
+// like sm_transition, but attaches an entry argument for the target's enter
+// handlers to read via sm_entry_arg()
+void sm_transition_arg(sm_t *sm, const sm_state_t *target, intptr_t arg);
+// the entry argument of the transition in progress; only meaningful inside
+// enter handlers (0 for sm_transition and machine init)
+intptr_t sm_entry_arg(const sm_t *sm);
 
 // is `state` the current leaf or one of its ancestors?
 bool sm_in(const sm_t *sm, const sm_state_t *state);

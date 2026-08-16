@@ -184,8 +184,7 @@ static int64_t ts_elapsed(int64_t now, int64_t old) {
 // ********************* state machine outline *********************
 //
 // IDLE                       TOGGLE -> REQUESTED
-// REQUESTED                  enter: retries=0, status_seen=NONE
-// |                          fwd: block 0x0C7, MITM 0x4ED
+// REQUESTED                  fwd: block 0x0C7, MITM 0x4ED
 // |                          TOGGLE (debounced) -> STOPPING
 // +- START_BURST (initial)   3 ticks of 4003 then 3 of E007; on completion,
 // |                          route by the status seen during the burst
@@ -193,7 +192,8 @@ static int64_t ts_elapsed(int64_t now, int64_t old) {
 // +- WAIT_STARTED            STATUS_STARTED -> ACTIVE; retry every 70s
 // +- ACTIVE                  STATUS_STARTING -> WAIT_STARTED (downgrade)
 //                            STATUS_IDLE -> "complete": stop (once mode) or idle
-// STOPPING                   TOGGLE -> REQUESTED (restart)
+// STOPPING                   entry arg: initial retry count (see stopping_enter)
+// |                          TOGGLE -> REQUESTED (restart)
 // +- STOP_BURST (initial)    3 ticks of 0000 then 3 of E007; stop confirmation
 // |                          deliberately doesn't count until the burst is done
 // +- WAIT_STOPPED            STATUS_IDLE -> IDLE; retry every 10s
@@ -217,29 +217,51 @@ static const sm_state_t S_IDLE, S_REQUESTED, S_START_BURST, S_WAIT_STARTING,
 static sm_t precon_sm;
 
 // ********************* state machine context *********************
-// data shared across states; everything else that used to be a flag here is
-// now represented by which state the machine is in
+// context is grouped by owner. the `requested` and `stopping` structs are
+// engine-managed (.ctx on their superstates): they belong to those states and
+// their children, and the engine zeroes them on entry so they can never carry
+// stale values across episodes. `platform` and `button` belong to the global
+// input hooks and are machine-wide.
 
-// is the status frame available? false if on unknown platform, true if we at any point receive a known status frame
-static bool status_frame_available = false;
-// timestamp of the start of the most recent start/stop burst, used for retry timing and the countdown display
-static int64_t last_attempt_ts = 0;
-// number of times we've re-sent the start (or stop) burst within the current request/stop
-static uint8_t retries = 0U;
 // highest precondition status the car has reported during the current request
 typedef enum {
     STATUS_SEEN_NONE = 0,
     STATUS_SEEN_STARTING,
     STATUS_SEEN_STARTED,
 } status_seen_t;
-static status_seen_t status_seen = STATUS_SEEN_NONE;
 
-// track previous state of activation button for edge detection
-static bool activation_button_state_prev = false;
-// timestamp of the activation button press edge, for short/long press detection
-static int64_t activation_press_start_ts = 0U;
-// has the current hold already triggered? (long press mode fires once per hold)
-static bool activation_long_press_fired = false;
+// owned by REQUESTED and its children
+static struct {
+    // timestamp of the start of the most recent start burst, used for retry timing and the countdown display
+    int64_t last_attempt_ts;
+    // number of times we've re-sent the start burst within the current request
+    uint8_t retries;
+    status_seen_t status_seen;
+} requested;
+
+// owned by STOPPING and its children
+static struct {
+    // timestamp of the start of the most recent stop burst, used for retry timing and the retry display
+    int64_t last_attempt_ts;
+    // number of times we've re-sent the stop burst within the current stop
+    uint8_t retries;
+} stopping;
+
+// process-lifetime platform discovery; latched by the global rx hook, never reset
+static struct {
+    // is the status frame available? false if on unknown platform, true if we at any point receive a known status frame
+    bool status_frame_available;
+} platform;
+
+// activation button edge tracking, owned by the global input hooks
+static struct {
+    // is the button currently held? tracked for edge detection
+    bool pressed;
+    // timestamp of the press edge, for short/long press detection
+    int64_t press_start_ts;
+    // has the current hold already triggered? (long press mode fires once per hold)
+    bool long_press_fired;
+} button;
 
 static QueueHandle_t battery_temperature_queue = NULL;
 
@@ -303,38 +325,24 @@ static void send_precondition_stop_msg(uint32_t burst_tick) {
 
 // ********************* shared state helpers *********************
 
-// enter the stop sequence. start_retries is 0 for a normal stop; passing
-// PRECONDITION_MAX_RETRIES makes it a single silent burst (no display, no
-// retries), which is how a failed start gives up.
-static void enter_stopping(sm_t *sm, uint8_t start_retries) {
-    retries = start_retries;
-    sm_transition(sm, &S_STOPPING);
-}
-
-// shared by both burst states: retry timers and countdown displays measure
-// from the moment the burst began
-static void burst_enter(sm_t *sm) {
-    last_attempt_ts = sm_now(sm);
-}
-
 // 0x4E8/0x4CC countdown display while a start is in flight
 // (shared by START_BURST, WAIT_STARTING, and WAIT_STARTED)
 static fwd_result_t starting_display_fwd(sm_t *sm, twai_message_t *to_send, can_bus_t fwd_bus) {
     // the display only runs until the car confirms preconditioning fully
     // started, which can happen mid-burst, before we route to ACTIVE
-    if (status_seen == STATUS_SEEN_STARTED) {
+    if (requested.status_seen == STATUS_SEEN_STARTED) {
         return FWD_PASSTHROUGH;
     }
     if (to_send->identifier == 0x4E8U) {
-        int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), last_attempt_ts);
+        int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), requested.last_attempt_ts);
         set_0x4e8_distance_flag(
             to_send,
             SECONDS_UNTIL_START(time_since_last_attempt),
             // display retry count in tenths digit
-            status_frame_available ? (retries % 10U) : 0U,
-            status_frame_available ? (retries == 0U ? DIST_UNIT_YD : DIST_UNIT_KM) : DIST_UNIT_M,
+            platform.status_frame_available ? (requested.retries % 10U) : 0U,
+            platform.status_frame_available ? (requested.retries == 0U ? DIST_UNIT_YD : DIST_UNIT_KM) : DIST_UNIT_M,
             // switch to the destination flag once the car confirms it's starting
-            status_frame_available ? (status_seen >= STATUS_SEEN_STARTING ? FLAG_DESTINATION : FLAG_BLUE_1) : FLAG_BLUE_4
+            platform.status_frame_available ? (requested.status_seen >= STATUS_SEEN_STARTING ? FLAG_DESTINATION : FLAG_BLUE_1) : FLAG_BLUE_4
         );
         return FWD_MODIFIED;
     }
@@ -350,17 +358,17 @@ static fwd_result_t starting_display_fwd(sm_t *sm, twai_message_t *to_send, can_
 static fwd_result_t stopping_display_fwd(sm_t *sm, twai_message_t *to_send, can_bus_t fwd_bus) {
     // only display when we can actually confirm/retry the stop, and hide it
     // once retries are exhausted (including the silent give-up stop)
-    if (!status_frame_available || retries >= PRECONDITION_MAX_RETRIES) {
+    if (!platform.status_frame_available || stopping.retries >= PRECONDITION_MAX_RETRIES) {
         return FWD_PASSTHROUGH;
     }
     if (to_send->identifier == 0x4E8U) {
-        int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), last_attempt_ts);
+        int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), stopping.last_attempt_ts);
         set_0x4e8_distance_flag(
             to_send,
             SECONDS_UNTIL_STOP_RETRY(time_since_last_attempt),
             // display retry count in tenths digit
-            retries % 10U,
-            retries == 0U ? DIST_UNIT_FT : DIST_UNIT_MI,
+            stopping.retries % 10U,
+            stopping.retries == 0U ? DIST_UNIT_FT : DIST_UNIT_MI,
             FLAG_NONE
         );
         return FWD_MODIFIED;
@@ -384,16 +392,11 @@ static bool idle_event(sm_t *sm, sm_event_t ev) {
 
 // ********************* REQUESTED (superstate) *********************
 
-static void requested_enter(sm_t *sm) {
-    retries = 0U;
-    status_seen = STATUS_SEEN_NONE;
-}
-
 static bool requested_event(sm_t *sm, sm_event_t ev) {
     if (ev == EV_TOGGLE) {
         // debounce between start and stop
         if (sm_time_in_us(sm, &S_REQUESTED) > PRECONDITION_DEBOUNCE_US) {
-            enter_stopping(sm, 0U);
+            sm_transition(sm, &S_STOPPING);
         }
         return true;
     }
@@ -417,12 +420,17 @@ static fwd_result_t requested_fwd(sm_t *sm, twai_message_t *to_send, can_bus_t f
 
 // ********************* REQUESTED / START_BURST *********************
 
+// retry timers and the countdown display measure from the moment the burst began
+static void start_burst_enter(sm_t *sm) {
+    requested.last_attempt_ts = sm_now(sm);
+}
+
 static void start_burst_tick(sm_t *sm) {
     uint32_t t = sm_ticks_in_state(sm);
     send_precondition_start_msg(t);
     if (t + 1U >= PRECONDITION_START_TICKS) {
         // route by what the status frame told us during the burst
-        switch (status_seen) {
+        switch (requested.status_seen) {
             case STATUS_SEEN_STARTED:
                 sm_transition(sm, &S_ACTIVE);
                 break;
@@ -442,12 +450,12 @@ static bool start_burst_event(sm_t *sm, sm_event_t ev) {
     // ends. TOGGLE falls through to REQUESTED.
     switch (ev) {
         case EV_STATUS_STARTING:
-            if (status_seen < STATUS_SEEN_STARTING) {
-                status_seen = STATUS_SEEN_STARTING;
+            if (requested.status_seen < STATUS_SEEN_STARTING) {
+                requested.status_seen = STATUS_SEEN_STARTING;
             }
             return true;
         case EV_STATUS_STARTED:
-            status_seen = STATUS_SEEN_STARTED;
+            requested.status_seen = STATUS_SEEN_STARTED;
             return true;
         case EV_STATUS_IDLE:
             // expected while the start is still in flight
@@ -459,8 +467,8 @@ static bool start_burst_event(sm_t *sm, sm_event_t ev) {
 // ********************* REQUESTED / WAIT_STARTING *********************
 
 static void wait_starting_tick(sm_t *sm) {
-    int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), last_attempt_ts);
-    if (!status_frame_available) {
+    int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), requested.last_attempt_ts);
+    if (!platform.status_frame_available) {
         // without status frames we can't confirm or retry anything; after the
         // timeout, assume it worked so the countdown display goes away
         if (time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US) {
@@ -469,12 +477,12 @@ static void wait_starting_tick(sm_t *sm) {
         return;
     }
     if (time_since_last_attempt > PRECONDITION_RETRY_US) {
-        if (retries < PRECONDITION_MAX_RETRIES) {
-            retries++;
+        if (requested.retries < PRECONDITION_MAX_RETRIES) {
+            requested.retries++;
             sm_transition(sm, &S_START_BURST);
         } else {
             // give up and send one silent stop attempt
-            enter_stopping(sm, PRECONDITION_MAX_RETRIES);
+            sm_transition_arg(sm, &S_STOPPING, PRECONDITION_MAX_RETRIES);
         }
     }
 }
@@ -482,11 +490,11 @@ static void wait_starting_tick(sm_t *sm) {
 static bool wait_starting_event(sm_t *sm, sm_event_t ev) {
     switch (ev) {
         case EV_STATUS_STARTING:
-            status_seen = STATUS_SEEN_STARTING;
+            requested.status_seen = STATUS_SEEN_STARTING;
             sm_transition(sm, &S_WAIT_STARTED);
             return true;
         case EV_STATUS_STARTED:
-            status_seen = STATUS_SEEN_STARTED;
+            requested.status_seen = STATUS_SEEN_STARTED;
             sm_transition(sm, &S_ACTIVE);
             return true;
         case EV_STATUS_IDLE:
@@ -501,13 +509,14 @@ static bool wait_starting_event(sm_t *sm, sm_event_t ev) {
 static void wait_started_tick(sm_t *sm) {
     // the car said "starting" but hasn't reached fully started
     // (i.e. we got 2AD 05 but not 15 after a long time)
-    int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), last_attempt_ts);
+    int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), requested.last_attempt_ts);
     if (time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US) {
-        if (retries < PRECONDITION_MAX_RETRIES) {
-            retries++;
+        if (requested.retries < PRECONDITION_MAX_RETRIES) {
+            requested.retries++;
             sm_transition(sm, &S_START_BURST);
         } else {
-            enter_stopping(sm, PRECONDITION_MAX_RETRIES);
+            // give up and send one silent stop attempt
+            sm_transition_arg(sm, &S_STOPPING, PRECONDITION_MAX_RETRIES);
         }
     }
 }
@@ -515,7 +524,7 @@ static void wait_started_tick(sm_t *sm) {
 static bool wait_started_event(sm_t *sm, sm_event_t ev) {
     switch (ev) {
         case EV_STATUS_STARTED:
-            status_seen = STATUS_SEEN_STARTED;
+            requested.status_seen = STATUS_SEEN_STARTED;
             sm_transition(sm, &S_ACTIVE);
             return true;
         case EV_STATUS_STARTING:
@@ -537,8 +546,8 @@ static bool active_event(sm_t *sm, sm_event_t ev) {
             // preconditioning was previously fully active, but now it's only showing as starting.
             // this is a weird situation to be in; let's just reset the current attempt time,
             // and let the retry logic continue as normal if it doesn't resolve itself after a while
-            last_attempt_ts = sm_now(sm);
-            status_seen = STATUS_SEEN_STARTING;
+            requested.last_attempt_ts = sm_now(sm);
+            requested.status_seen = STATUS_SEEN_STARTING;
             sm_transition(sm, &S_WAIT_STARTED);
             return true;
         case EV_STATUS_IDLE:
@@ -550,7 +559,7 @@ static bool active_event(sm_t *sm, sm_event_t ev) {
                 // in "once" mode, actually attempt to actively stop preconditioning.
                 // this should prevent preconditioning from restarting once the battery falls back below temp.
                 // TODO(ejones): this needs testing
-                enter_stopping(sm, 0U);
+                sm_transition(sm, &S_STOPPING);
             } else {
                 // TODO(ejones): continuous mode needs more development. for now,
                 // this just doesn't attempt to stop preconditoning and lets the BMU do what it wants
@@ -564,6 +573,13 @@ static bool active_event(sm_t *sm, sm_event_t ev) {
 
 // ********************* STOPPING (superstate) *********************
 
+// the entry argument carries the initial retry count: 0 (the default) for a
+// normal stop, PRECONDITION_MAX_RETRIES for a single silent burst (no display,
+// no retries), which is how a failed start gives up
+static void stopping_enter(sm_t *sm) {
+    stopping.retries = (uint8_t)sm_entry_arg(sm);
+}
+
 static bool stopping_event(sm_t *sm, sm_event_t ev) {
     if (ev == EV_TOGGLE) {
         // activation while stopping restarts preconditioning
@@ -575,12 +591,17 @@ static bool stopping_event(sm_t *sm, sm_event_t ev) {
 
 // ********************* STOPPING / STOP_BURST *********************
 
+// retry timers and the retry display measure from the moment the burst began
+static void stop_burst_enter(sm_t *sm) {
+    stopping.last_attempt_ts = sm_now(sm);
+}
+
 static void stop_burst_tick(sm_t *sm) {
     uint32_t t = sm_ticks_in_state(sm);
     send_precondition_stop_msg(t);
     if (t + 1U >= PRECONDITION_STOP_TICKS) {
         // without status frames there's no confirmation or retry to wait for
-        sm_transition(sm, status_frame_available ? &S_WAIT_STOPPED : &S_IDLE);
+        sm_transition(sm, platform.status_frame_available ? &S_WAIT_STOPPED : &S_IDLE);
     }
 }
 
@@ -596,10 +617,10 @@ static bool stop_burst_event(sm_t *sm, sm_event_t ev) {
 // ********************* STOPPING / WAIT_STOPPED *********************
 
 static void wait_stopped_tick(sm_t *sm) {
-    int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), last_attempt_ts);
+    int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), stopping.last_attempt_ts);
     if (time_since_last_attempt > PRECONDITION_RETRY_US) {
-        if (retries < PRECONDITION_MAX_RETRIES) {
-            retries++;
+        if (stopping.retries < PRECONDITION_MAX_RETRIES) {
+            stopping.retries++;
             sm_transition(sm, &S_STOP_BURST);
         } else {
             // give up; the retry display is already hidden at max retries
@@ -626,7 +647,8 @@ static const sm_state_t S_IDLE = {
 static const sm_state_t S_REQUESTED = {
     .name = "requested",
     .initial = &S_START_BURST,
-    .enter = requested_enter,
+    .ctx = &requested,
+    .ctx_size = sizeof(requested),
     .event = requested_event,
     .fwd = requested_fwd,
 };
@@ -634,7 +656,7 @@ static const sm_state_t S_REQUESTED = {
 static const sm_state_t S_START_BURST = {
     .name = "start-burst",
     .parent = &S_REQUESTED,
-    .enter = burst_enter,
+    .enter = start_burst_enter,
     .tick = start_burst_tick,
     .event = start_burst_event,
     .fwd = starting_display_fwd,
@@ -665,13 +687,16 @@ static const sm_state_t S_ACTIVE = {
 static const sm_state_t S_STOPPING = {
     .name = "stopping",
     .initial = &S_STOP_BURST,
+    .ctx = &stopping,
+    .ctx_size = sizeof(stopping),
+    .enter = stopping_enter,
     .event = stopping_event,
 };
 
 static const sm_state_t S_STOP_BURST = {
     .name = "stop-burst",
     .parent = &S_STOPPING,
-    .enter = burst_enter,
+    .enter = stop_burst_enter,
     .tick = stop_burst_tick,
     .event = stop_burst_event,
     .fwd = stopping_display_fwd,
@@ -691,10 +716,10 @@ static void precondition_input_tick(sm_t *sm) {
     // long press mode: trigger once when the hold crosses the threshold, without
     // waiting for the release frame. state only becomes pressed via the rx hook,
     // so this does nothing when the activation button is disabled
-    if (activation_button_state_prev && !activation_long_press_fired
+    if (button.pressed && !button.long_press_fired
             && cached_precon_press_type() == PRESS_LONG
-            && ts_elapsed(sm_now(sm), activation_press_start_ts) >= PRECONDITION_LONG_PRESS_US) {
-        activation_long_press_fired = true;
+            && ts_elapsed(sm_now(sm), button.press_start_ts) >= PRECONDITION_LONG_PRESS_US) {
+        button.long_press_fired = true;
         sm_send_event(sm, EV_TOGGLE);
     }
 }
@@ -707,7 +732,7 @@ static void precondition_input_rx(sm_t *sm, const twai_message_t *to_push, can_b
     // the head unit bus must not drive the state machine
     if (IS_STATUS_FRAME(to_push->identifier) && rx_bus == CAR_BUS) {
         // we now know we have the status frame on the current car, so we should use it
-        status_frame_available = true;
+        platform.status_frame_available = true;
 
         uint8_t status = to_push->data[1];
         if (STATUS_STARTED(status)) {
@@ -743,20 +768,20 @@ static void precondition_input_rx(sm_t *sm, const twai_message_t *to_push, can_b
     // track activation button press/release edges. short press mode triggers on
     // the release edge if the hold stayed under the threshold; long press mode
     // triggers from the tick hook once the hold crosses the threshold
-    const message_payload_t *button = &activation_messages[precon_button_type];
-    if (activation_is_press(button, to_push)) {
-        if (!activation_button_state_prev) {
-            activation_press_start_ts = sm_now(sm);
-            activation_long_press_fired = false;
+    const message_payload_t *activation = &activation_messages[precon_button_type];
+    if (activation_is_press(activation, to_push)) {
+        if (!button.pressed) {
+            button.press_start_ts = sm_now(sm);
+            button.long_press_fired = false;
         }
-        activation_button_state_prev = true;
-    } else if (activation_is_release(button, to_push)) {
-        if (activation_button_state_prev
+        button.pressed = true;
+    } else if (activation_is_release(activation, to_push)) {
+        if (button.pressed
                 && cached_precon_press_type() == PRESS_SHORT
-                && ts_elapsed(sm_now(sm), activation_press_start_ts) < PRECONDITION_LONG_PRESS_US) {
+                && ts_elapsed(sm_now(sm), button.press_start_ts) < PRECONDITION_LONG_PRESS_US) {
             sm_send_event(sm, EV_TOGGLE);
         }
-        activation_button_state_prev = false;
+        button.pressed = false;
     }
 }
 
