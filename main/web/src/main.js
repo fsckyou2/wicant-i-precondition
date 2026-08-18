@@ -56,7 +56,32 @@ async function checkFirmwareUpdate() {
     document.addEventListener('DOMContentLoaded', (event) => {
         document.getElementById("submit_button").disabled = true;
         setRTCTime();
+        syncPreconButtonToggle();
     });
+
+    // If the currently selected button is one of the extra options, show the
+    // full list so the selection stays visible. Called on load and again after
+    // the device config populates the dropdown value.
+    function syncPreconButtonToggle() {
+        const preconSelect = document.getElementById("precon_button");
+        if (!preconSelect) {
+            return;
+        }
+        const selectedOption = preconSelect.options[preconSelect.selectedIndex];
+        if (selectedOption && selectedOption.classList.contains("precon_button_extra")) {
+            document.getElementById("precon_button_show_all").checked = true;
+        }
+        togglePreconButtonOptions();
+    }
+
+    // Client-side only: show or hide the extra preconditioning button options.
+    // Does not affect the value submitted to the device.
+    function togglePreconButtonOptions() {
+        const showAll = document.getElementById("precon_button_show_all").checked;
+        document.querySelectorAll(".precon_button_extra").forEach(option => {
+            option.hidden = !showAll;
+        });
+    }
     let latest_car_models = null;
     let bleAlertShown = false;
     function loadCarModels(data) {
@@ -2808,6 +2833,17 @@ function configurePeriodicWakeup(elements) {
     }
 }
 document.getElementById("defaultOpen").click();
+function formatAge(ageMs) {
+    const seconds = Math.max(0, Math.round(ageMs / 1000));
+    if (seconds < 60) return `${seconds}s`;
+
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m`;
+
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h`;
+}
+
 function checkStatus() {
     const xhttp = new XMLHttpRequest();
     xhttp.onload = function() {
@@ -2923,6 +2959,14 @@ function checkStatus() {
         if (restartBootCountEl) restartBootCountEl.innerHTML = (obj.restart_boot_count ?? 0);
         const restartUnexpectedCountEl = document.getElementById("restart_unexpected_reset_count");
         if (restartUnexpectedCountEl) restartUnexpectedCountEl.innerHTML = (obj.restart_unexpected_reset_count ?? 0);
+        const batteryTempEl = document.getElementById("battery_temp_status");
+        if (batteryTempEl) {
+            if (obj.battery_temp_valid) {
+                batteryTempEl.textContent = `Min: ${obj.battery_temp_min_c} °C; Max: ${obj.battery_temp_max_c} °C; (${formatAge(obj.battery_temp_age_ms)} ago)`;
+            } else {
+                batteryTempEl.textContent = "Waiting for CAN data";
+            }
+        }
         checkFirmwareUpdate();
     };
     xhttp.open("GET", "/check_status");
@@ -3538,6 +3582,9 @@ async function postConfig() {
     obj["log_period"] = document.getElementById("log_period").value;
     obj["imu_threshold"] = document.getElementById("imu_threshold").value;
     obj["elm327_udp_log"] = document.getElementById("elm327_udp_log").value;
+    obj["precon_mode"] = document.getElementById("precon_mode").value;
+    obj["precon_button"] = document.getElementById("precon_button").value;
+    obj["precon_press"] = document.getElementById("precon_press").value;
 
     // Collect fallback networks (max 5)
     try {
@@ -4106,6 +4153,13 @@ xhttp.onload = async function() {
             elmUdp.value = obj.elm327_udp_log || "disable";
         }
         toggleElm327UdpLogWarning();
+
+        // Preconditioning settings. Configs written by stock firmware have no
+        // precon_* keys, so fall back to the same defaults the device uses.
+        document.getElementById("precon_mode").value = obj.precon_mode || "once";
+        document.getElementById("precon_button").value = obj.precon_button || "sw_star";
+        document.getElementById("precon_press").value = obj.precon_press || "short";
+        syncPreconButtonToggle();
         
         const blePowerVal = ("ble_power" in obj) ? obj.ble_power : 9;
         document.getElementById("ble_power").value = blePowerVal;
