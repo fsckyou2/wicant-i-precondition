@@ -99,6 +99,8 @@
 #include "obd2_standard_pids.h"
 #include "restart_tracker.h"
 #include "restart_tracker_http.h"
+#include "esp_timer.h"
+#include "precondition.h"
 
 #include <ws_router.h>
 #include "ws_server.h"
@@ -235,7 +237,8 @@ const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\",\"we
 										\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\
 								\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_en\":\"disable\",\"mqtt_elm327_log\":\"disable\",\"elm327_udp_log\":\"disable\",\"mqtt_url\":\"mqtt://127.0.0.1\",\"mqtt_port\":\"1883\",\
 										\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\",\"mqtt_security\":\"none\",\"mqtt_cert_set\": \"default\",\"mqtt_skip_cn\":\"disable\",\
-										\"logger_status\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\"}";
+										\"logger_status\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\",\
+										\"precon_mode\":\"once\",\"precon_button\":\"sw_star\",\"precon_press\":\"short\"}";
 
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_en\":\"disable\",\"mqtt_elm327_log\":\"disable\",\"mqtt_url\":\"mqtt://127.0.0.1\",\"mqtt_port\":\"1883\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"periodic_wakeup\":\"disable\",\"wakeup_interval\":\"5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_en\":\"disable\",\"mqtt_elm327_log\":\"disable\",\"mqtt_url\":\"mqtt://127.0.0.1\",\"mqtt_port\":\"1883\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
@@ -1879,6 +1882,27 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "mqtt_tx_topic", device_config.mqtt_tx_topic);
 	cJSON_AddStringToObject(root, "mqtt_rx_topic", device_config.mqtt_rx_topic);
 	cJSON_AddStringToObject(root, "mqtt_status_topic", device_config.mqtt_status_topic);
+	cJSON_AddStringToObject(root, "precon_mode", device_config.precon_mode);
+	cJSON_AddStringToObject(root, "precon_button", device_config.precon_button);
+	cJSON_AddStringToObject(root, "precon_press", device_config.precon_press);
+
+	{
+		precondition_temperature_t temperature;
+
+		if(precondition_get_battery_temperature(&temperature))
+		{
+			cJSON_AddBoolToObject(root, "battery_temp_valid", true);
+			cJSON_AddNumberToObject(root, "battery_temp_min_c", temperature.min_c);
+			cJSON_AddNumberToObject(root, "battery_temp_max_c", temperature.max_c);
+			cJSON_AddNumberToObject(root, "battery_temp_age_ms",
+									(esp_timer_get_time() - temperature.updated_at_us) / 1000);
+		}
+		else
+		{
+			cJSON_AddBoolToObject(root, "battery_temp_valid", false);
+		}
+	}
+
 	cJSON_AddStringToObject(root, "device_id", device_id);
 	cJSON_AddStringToObject(root, "subnet_overlap", dev_status_is_bit_set(DEV_STA_AP_OVERLAP_BIT) ? "yes" : "no");
 
@@ -3006,8 +3030,61 @@ static void config_server_load_cfg(char *cfg)
 	}
 	strlcpy(device_config.mqtt_status_topic, key->valuestring, sizeof(device_config.mqtt_status_topic));
 
-	
+
 	ESP_LOGI(TAG, "device_config.mqtt_status_topic: %s", device_config.mqtt_status_topic);
+	//*****
+
+	//*****
+	// The precon_* keys are absent from configs written by stock firmware, so
+	// fall back to the defaults rather than rejecting the whole config.
+	key = cJSON_GetObjectItem(root,"precon_mode");
+	if(key == 0 || key->valuestring == NULL)
+	{
+		strlcpy(device_config.precon_mode, "once", sizeof(device_config.precon_mode));
+	}
+	else if(strlen(key->valuestring) > sizeof(device_config.precon_mode))
+	{
+		goto config_error;
+	}
+	else
+	{
+		strlcpy(device_config.precon_mode, key->valuestring, sizeof(device_config.precon_mode));
+	}
+	ESP_LOGI(TAG, "device_config.precon_mode: %s", device_config.precon_mode);
+	//*****
+
+	//*****
+	key = cJSON_GetObjectItem(root,"precon_button");
+	if(key == 0 || key->valuestring == NULL)
+	{
+		strlcpy(device_config.precon_button, "sw_star", sizeof(device_config.precon_button));
+	}
+	else if(strlen(key->valuestring) > sizeof(device_config.precon_button))
+	{
+		goto config_error;
+	}
+	else
+	{
+		strlcpy(device_config.precon_button, key->valuestring, sizeof(device_config.precon_button));
+	}
+	ESP_LOGI(TAG, "device_config.precon_button: %s", device_config.precon_button);
+	//*****
+
+	//*****
+	key = cJSON_GetObjectItem(root,"precon_press");
+	if(key == 0 || key->valuestring == NULL)
+	{
+		strlcpy(device_config.precon_press, "short", sizeof(device_config.precon_press));
+	}
+	else if(strlen(key->valuestring) > sizeof(device_config.precon_press))
+	{
+		goto config_error;
+	}
+	else
+	{
+		strlcpy(device_config.precon_press, key->valuestring, sizeof(device_config.precon_press));
+	}
+	ESP_LOGI(TAG, "device_config.precon_press: %s", device_config.precon_press);
 	//*****
 
 	//*****
@@ -4269,3 +4346,114 @@ void config_server_set_ble_config(uint8_t b)
     cJSON_Delete(root);
 }
 
+
+int8_t config_server_precon_button(void)
+{
+	if(strcmp(device_config.precon_button, "sw_star") == 0)
+	{
+		return SW_STAR;
+	}
+	else if(strcmp(device_config.precon_button, "avn_star") == 0)
+	{
+		return AVN_STAR;
+	}
+	else if(strcmp(device_config.precon_button, "avn_tuner_in") == 0)
+	{
+		return AVN_TUNER_IN;
+	}
+	else if(strcmp(device_config.precon_button, "avn_vol_in") == 0)
+	{
+		return AVN_VOL_IN;
+	}
+	else if(strcmp(device_config.precon_button, "sw_mode") == 0)
+	{
+		return SW_MODE;
+	}
+	else if(strcmp(device_config.precon_button, "sw_speak") == 0)
+	{
+		return SW_SPEAK;
+	}
+	else if(strcmp(device_config.precon_button, "sw_call") == 0)
+	{
+		return SW_CALL;
+	}
+	else if(strcmp(device_config.precon_button, "sw_vol_in") == 0)
+	{
+		return SW_VOL_IN;
+	}
+	else if(strcmp(device_config.precon_button, "sw_vol_up") == 0)
+	{
+		return SW_VOL_UP;
+	}
+	else if(strcmp(device_config.precon_button, "sw_vol_down") == 0)
+	{
+		return SW_VOL_DOWN;
+	}
+	else if(strcmp(device_config.precon_button, "sw_skip_up") == 0)
+	{
+		return SW_SKIP_UP;
+	}
+	else if(strcmp(device_config.precon_button, "sw_skip_down") == 0)
+	{
+		return SW_SKIP_DOWN;
+	}
+	else if(strcmp(device_config.precon_button, "sw_ok") == 0)
+	{
+		return SW_OK;
+	}
+	else if(strcmp(device_config.precon_button, "avn_map") == 0)
+	{
+		return AVN_MAP;
+	}
+	else if(strcmp(device_config.precon_button, "avn_nav") == 0)
+	{
+		return AVN_NAV;
+	}
+	else if(strcmp(device_config.precon_button, "avn_media") == 0)
+	{
+		return AVN_MEDIA;
+	}
+	else if(strcmp(device_config.precon_button, "avn_tuner_up") == 0)
+	{
+		return AVN_TUNER_UP;
+	}
+	else if(strcmp(device_config.precon_button, "avn_tuner_down") == 0)
+	{
+		return AVN_TUNER_DOWN;
+	}
+	else if(strcmp(device_config.precon_button, "ev6_avn_setup") == 0)
+	{
+		return EV6_AVN_SETUP;
+	}
+	else if(strcmp(device_config.precon_button, "disabled") == 0)
+	{
+		return BUTTON_DISABLED;
+	}
+	return SW_STAR;
+}
+
+int8_t config_server_precon_mode(void)
+{
+	if(strcmp(device_config.precon_mode, "once") == 0)
+	{
+		return ONCE;
+	}
+	else if(strcmp(device_config.precon_mode, "continuous") == 0)
+	{
+		return CONTINUOUS;
+	}
+	else if(strcmp(device_config.precon_mode, "persistent") == 0)
+	{
+		return PERSISTENT;
+	}
+	return ONCE;
+}
+
+int8_t config_server_precon_press(void)
+{
+	if(strcmp(device_config.precon_press, "long") == 0)
+	{
+		return PRESS_LONG;
+	}
+	return PRESS_SHORT;
+}

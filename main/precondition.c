@@ -1,0 +1,674 @@
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+#include "esp_timer.h"
+#include "esp_log.h"
+#include "can.h"
+#include "precondition.h"
+#include "config_server.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+
+#define TAG __func__
+
+// ********************* 0x4E8 distance/flag display *********************
+
+typedef enum {
+    DIST_UNIT_M = 0x0U,
+    DIST_UNIT_KM = 0x1U,
+    DIST_UNIT_MI = 0x2U,
+    DIST_UNIT_FT = 0x3U,
+    DIST_UNIT_YD = 0x4U,
+} dist_unit_t;
+
+typedef enum {
+    FLAG_DESTINATION = 0x0U,
+    FLAG_BLUE_1 = 0x1U,
+    FLAG_BLUE_2 = 0x2U,
+    FLAG_BLUE_3 = 0x3U,
+    FLAG_BLUE_4 = 0x4U,
+    FLAG_NONE = 0xFU,
+} flag_type_t;
+
+// Set data bytes on a 0x4E8 CANPacket_t to display a distance and flag.
+//   distance_int: integer part (0-65534, or 0xFFFF to hide number/unit)
+//   distance_tenths: tenths digit (0-9, only shown when unit is km or mi and integer < 100)
+//   unit: distance unit (see dist_unit_t)
+//   flag: flag icon (see flag_type_t)
+static void set_0x4e8_distance_flag(twai_message_t *packet, uint16_t distance_int, uint8_t distance_tenths, dist_unit_t unit, flag_type_t flag) {
+    packet->data[0] = (uint8_t)(((distance_tenths & 0xFU) << 4U) | (unit & 0xFU));
+    packet->data[4] = (uint8_t)(distance_int & 0xFFU);
+    packet->data[5] = (uint8_t)((distance_int >> 8U) & 0xFFU);
+    packet->data[6] = (packet->data[6] & 0xF0U) | (flag & 0xFU);
+}
+
+// ********************* precondition logic *********************
+
+// is the user currently requesting preconditioning to be active?
+static bool precondition_requested = false;
+// is the BMU managing preconditioning?
+static bool precondition_BMU_managed = false;
+// is the car currently in READY? tracked from the 0x038 power status frame
+static bool car_in_ready = false;
+// is the power status frame available? false until we receive a 0x038 frame,
+// so platforms that don't broadcast it never enforce the READY gate
+static bool power_status_available = false;
+// timestamp of when the car last entered READY (0 if never seen)
+static int64_t car_ready_ts = 0;
+// timestamp of the last keepalive start burst while the BMU is managing
+static int64_t precondition_keepalive_ts = 0;
+// ticks remaining in the current keepalive start burst
+static uint8_t precondition_keepalive_ticks_remaining = 0U;
+// timestamp of when the user requested preconditioning
+static int64_t precondition_requested_ts = 0U;
+// timestamp of last attempt to send precondition message, used for retry logic
+static int64_t precondition_last_attempt_ts = 0U;
+// number of ticks remaining to send precondition start/stop messages, used for initial burst logic
+static uint8_t precondition_start_ticks_remaining = 0U;
+static uint8_t precondition_stop_ticks_remaining = 0U;
+// number of times we've retried sending precondition messages, used for retry logic
+static uint8_t precondition_retries = 0U;
+// has preconditioning been confirmed to be starting by the status frame?
+static bool precondition_starting_confirmed = false;
+// has preconditioning been confirmed to be active by the status frame?
+static bool precondition_started_confirmed = false;
+// has precondition stop been confirmed by the status frame?
+static bool precondition_stop_confirmed = true;
+// track previous state of activation button for edge detection
+static bool activation_button_state_prev = false;
+// timestamp of the activation button press edge, for short/long press detection
+static int64_t activation_press_start_ts = 0U;
+// has the current hold already triggered? (long press mode fires once per hold)
+static bool activation_long_press_fired = false;
+// is the status frame available? false if on unknown platform, true if we at any point receive a known status frame
+static bool status_frame_available = false;
+
+static QueueHandle_t battery_temperature_queue = NULL;
+
+typedef enum {
+    // frame carries the current button state: pressed while (byte & mask) == value
+    MSG_STATE,
+    // frame is an event whose masked byte takes distinct press/release values
+    MSG_EVENT,
+} message_type_t;
+
+typedef struct {
+    uint32_t frame_id;
+    message_type_t type;
+    union {
+        struct {
+            uint8_t byte_index;
+            uint8_t byte_mask;
+            uint8_t byte_value;
+        } state;
+        struct {
+            uint8_t byte_index;
+            uint8_t byte_mask;
+            // TODO(ejones): maybe use a bit set or some other
+            // way of representing any number of possibilities
+            uint8_t press_values[2];   // either value means pressed
+            uint8_t release_values[2]; // either value means released
+        } pair;
+    };
+} message_payload_t;
+
+// map of the buttons that can be used to activate preconditioning.
+// note: SW buttons (0x448) have a periodic idle message;
+//       AVN buttons (0x651/0x652) only send on press/release.
+const static message_payload_t activation_messages[NUM_PRECON_BUTTONS] = {
+    [SW_STAR]         = {0x448, MSG_STATE, .state = {5, 0xF0, 0x10}},
+    [AVN_STAR]        = {0x652, MSG_EVENT,  .pair  = {1, 0x0F, {0x04, 0x07}, {0x00, 0x03}}},
+    [AVN_TUNER_IN]    = {0x651, MSG_EVENT,  .pair  = {3, 0xF0, {0x40, 0x70}, {0x00, 0x30}}},
+    [AVN_VOL_IN]      = {0x651, MSG_EVENT,  .pair  = {1, 0xF0, {0x40, 0x70}, {0x00, 0x30}}},
+    [SW_MODE]         = {0x448, MSG_STATE, .state = {2, 0xF0, 0x40}},
+    [SW_SPEAK]        = {0x448, MSG_STATE, .state = {2, 0x0F, 0x01}},
+    [SW_CALL]         = {0x448, MSG_STATE, .state = {2, 0x0F, 0x04}},
+    [SW_VOL_IN]       = {0x448, MSG_STATE, .state = {3, 0x0F, 0x01}},
+    [SW_VOL_UP]       = {0x448, MSG_STATE, .state = {4, 0x0F, 0x01}},
+    [SW_VOL_DOWN]     = {0x448, MSG_STATE, .state = {3, 0xF0, 0x40}},
+    [SW_SKIP_UP]      = {0x448, MSG_STATE, .state = {3, 0xF0, 0x10}},
+    [SW_SKIP_DOWN]    = {0x448, MSG_STATE, .state = {3, 0x0F, 0x04}},
+    [SW_OK]           = {0x448, MSG_STATE, .state = {6, 0xF0, 0x10}},
+    [AVN_MAP]         = {0x652, MSG_EVENT,  .pair  = {0, 0xF0, {0x40, 0x70}, {0x00, 0x30}}},
+    [AVN_NAV]         = {0x652, MSG_EVENT,  .pair  = {0, 0xF0, {0x10, 0xD0}, {0x00, 0xC0}}},
+    [AVN_MEDIA]       = {0x652, MSG_EVENT,  .pair  = {0, 0x0F, {0x01, 0x0D}, {0x00, 0x0C}}},
+    [AVN_TUNER_UP]    = {0x652, MSG_EVENT,  .pair  = {3, 0x0F, {0x04, 0x07}, {0x00, 0x03}}},
+    [AVN_TUNER_DOWN]  = {0x652, MSG_EVENT,  .pair  = {3, 0x0F, {0x01, 0x0D}, {0x00, 0x0C}}},
+    [EV6_AVN_SETUP]   = {0x652, MSG_EVENT,  .pair  = {1, 0x0F, {0x01, 0x0D}, {0x00, 0x0C}}},
+};
+_Static_assert(sizeof(activation_messages) / sizeof(activation_messages[0])
+               == NUM_PRECON_BUTTONS, "button table size mismatch");
+
+static bool state_matches(const message_payload_t *msg, const twai_message_t *f) {
+    return (f->data[msg->state.byte_index] & msg->state.byte_mask) == msg->state.byte_value;
+}
+
+static bool pair_matches(const message_payload_t *msg, const twai_message_t *f, const uint8_t values[2]) {
+    uint8_t masked = f->data[msg->pair.byte_index] & msg->pair.byte_mask;
+    return masked == values[0] || masked == values[1];
+}
+
+static bool activation_is_press(const message_payload_t *msg, const twai_message_t *f) {
+    if (f->identifier != msg->frame_id) {
+        return false;
+    }
+    switch (msg->type) {
+        case MSG_STATE:
+            return state_matches(msg, f);
+        case MSG_EVENT:
+            return pair_matches(msg, f, msg->pair.press_values);
+    }
+    return false;
+}
+
+static bool activation_is_release(const message_payload_t *msg, const twai_message_t *f) {
+    if (f->identifier != msg->frame_id) {
+        return false;
+    }
+    switch (msg->type) {
+        case MSG_STATE:
+            return !state_matches(msg, f);
+        case MSG_EVENT:
+            return pair_matches(msg, f, msg->pair.release_values);
+    }
+    return false;
+}
+
+// 0x2AD on Ioniq 5/EV6, 0x0A82AA03 on Ioniq 6
+#define IS_STATUS_FRAME(frame_id) \
+    ((frame_id) == 0x2ADU || (frame_id) == 0x0A82AA03U)
+
+#define STATUS_MASK 0b00011111U  // i.e. 0x15 and 0x55 are both valid "started" status
+#define STATUS_IDLE(status_byte) \
+    (((status_byte) & STATUS_MASK) == 0x01U)
+#define STATUS_STARTING(status_byte) \
+    (((status_byte) & STATUS_MASK) == 0x05U)
+#define STATUS_STARTED(status_byte) \
+    (((status_byte) & STATUS_MASK) == 0x15U)
+
+#define IS_POWER_STATUS_FRAME(frame_id) \
+    ((frame_id) == 0x038U)
+
+// unclear if this is necessary and sufficient
+// #define POWER_STATUS_MASK 0b00000100U
+#define POWER_STATUS_MASK 0x0F
+#define POWER_STATUS_READY(power_status_byte) \
+    (((power_status_byte) & POWER_STATUS_MASK) == 0x04U)
+
+#define PRECONDITION_DEBOUNCE_US 1000000U  // 1 second
+#define PRECONDITION_LONG_PRESS_US 1000000U  // short/long press threshold: 1 second
+#define PRECONDITION_START_PHASE1_TICKS 3U // 4003 message
+#define PRECONDITION_START_PHASE2_TICKS 3U // E007 message
+#define PRECONDITION_START_TICKS (PRECONDITION_START_PHASE1_TICKS + PRECONDITION_START_PHASE2_TICKS)
+#define PRECONDITION_STOP_PHASE1_TICKS 3U  // 0000 message
+#define PRECONDITION_STOP_PHASE2_TICKS 3U  // E007 message
+#define PRECONDITION_STOP_TICKS (PRECONDITION_STOP_PHASE1_TICKS + PRECONDITION_STOP_PHASE2_TICKS)
+#define PRECONDITION_RETRY_US 10000000U  // 10 seconds
+#define PRECONDITION_MAX_RETRIES 4U
+#define PRECONDITION_STARTED_TIMEOUT_US 70000000U  // 70 seconds
+#define PRECONDITION_RESTART_WINDOW_US 8000000U  // persistent mode: re-request within 8 seconds of the car entering READY
+#define PRECONDITION_KEEPALIVE_US 300000000U  // 5 minutes between keepalive start bursts while the BMU is managing
+
+#define BATTERY_TEMPERATURE_FRAME_ID 0x152U
+#define BATTERY_TEMPERATURE_MIN_INDEX 0U
+#define BATTERY_TEMPERATURE_MAX_INDEX 1U
+#define BATTERY_TEMPERATURE_DATA_LENGTH 2U
+
+#define IS_BATTERY_TEMPERATURE_FRAME(frame_id) ((frame_id) == BATTERY_TEMPERATURE_FRAME_ID)
+
+#define CAR_BUS CAN_BUS_0
+
+#define SECONDS_UNTIL_START(elapsed) \
+    (((elapsed) >= PRECONDITION_STARTED_TIMEOUT_US) ? 0U : \
+     ((PRECONDITION_STARTED_TIMEOUT_US - (elapsed)) / 1000000U))
+
+#define SECONDS_UNTIL_STOP_RETRY(elapsed) \
+    (((elapsed) >= PRECONDITION_RETRY_US) ? 0U : \
+     ((PRECONDITION_RETRY_US - (elapsed)) / 1000000U))
+
+static int64_t now_us(void) {
+    return esp_timer_get_time();
+}
+
+static int64_t ts_elapsed(int64_t now, int64_t old) {
+    return now - old;
+}
+
+void precondition_init(void) {
+    battery_temperature_queue = xQueueCreate(1, sizeof(precondition_temperature_t));
+    configASSERT(battery_temperature_queue != NULL);
+}
+
+static void send_precondition_start_msg(uint8_t ticks_remaining) {
+    twai_message_t packet = {0};
+    packet.identifier = 0x0C7U;
+    packet.data_length_code = 8U;
+    if (ticks_remaining > PRECONDITION_START_PHASE2_TICKS) {
+        // send 0000004003000000 to 0x0C7
+        packet.data[3] = 0x40U;
+        packet.data[4] = 0x03U;
+    } else {
+        // send 000000E007000000 to 0x0C7
+        packet.data[3] = 0xE0U;
+        packet.data[4] = 0x07U;
+    }
+    // TODO(ejones): ensure that blocking for 1 tick is the right move here and elsewhere
+    can_send(&packet, 1);
+}
+
+static void send_precondition_stop_msg(uint8_t ticks_remaining) {
+    twai_message_t packet = {0};
+    packet.identifier = 0x0C7U;
+    packet.data_length_code = 8U;
+    if (ticks_remaining <= PRECONDITION_STOP_PHASE2_TICKS) {
+        // send 000000E007000000 to 0x0C7
+        packet.data[3] = 0xE0U;
+        packet.data[4] = 0x07U;
+    }
+    can_send(&packet, 1);
+}
+
+// Decide whether to block, modify, or passthrough a message for preconditioning.
+// Modifies packet data in-place when returning FWD_MODIFIED.
+// The Pro taps the bus in parallel rather than bridging it, so only
+// FWD_MODIFIED has an effect here: the caller injects the modified copy
+// alongside the original. FWD_BLOCK can't pull back a frame that is already on
+// the wire, and is kept only so the decision stays readable.
+// fwd_bus is the destination bus.
+fwd_result_t precondition_fwd_hook(twai_message_t *to_send, can_bus_t fwd_bus) {
+    // block 0x0C7 message so that the head unit doesn't turn off preconditioning on us
+    if ((precondition_requested || precondition_BMU_managed) && to_send->identifier == 0x0C7U && fwd_bus == CAR_BUS) {
+        return FWD_BLOCK;
+    }
+
+    // MITM 0x4ED message while preconditioning is requested
+    if ((precondition_requested || precondition_BMU_managed) && to_send->identifier == 0x4EDU && fwd_bus == CAR_BUS) {
+        to_send->data[5] = 0x10U;
+        to_send->data[6] = 0xA0U;
+        to_send->data[7] = 0x00U;
+        return FWD_MODIFIED;
+    }
+
+    // we are currently starting preconditioning and want to display the countdown flag.
+    if (precondition_requested && !precondition_started_confirmed && fwd_bus == CAR_BUS) {
+        int64_t now = now_us();
+        int64_t time_since_last_attempt = ts_elapsed(now, precondition_last_attempt_ts);
+        if (to_send->identifier == 0x4E8U) {
+            // i'm sorry for the nested ternary operators. i don't feel like fixing it right now
+            set_0x4e8_distance_flag(
+                to_send,
+                SECONDS_UNTIL_START(time_since_last_attempt),
+                // display retry count in tenths digit
+                status_frame_available ? (precondition_retries % 10) : 0,
+                status_frame_available ? (precondition_retries == 0 ? DIST_UNIT_YD : DIST_UNIT_KM) : DIST_UNIT_M,
+                // switch to destination flag after we get 05 for 2AD
+                status_frame_available ? (precondition_starting_confirmed ? FLAG_DESTINATION : FLAG_BLUE_1) : FLAG_BLUE_4
+            );
+            return FWD_MODIFIED;
+        }
+
+        if (to_send->identifier == 0x4CCU) {
+            to_send->data[0] = 0x02U;
+            return FWD_MODIFIED;
+        }
+    }
+
+    // we are currently trying to stop preconditioning and want to display the retry status.
+    if (!precondition_requested
+            && status_frame_available
+            && !precondition_stop_confirmed
+            && precondition_retries < PRECONDITION_MAX_RETRIES
+            && fwd_bus == CAR_BUS) {
+        int64_t now = now_us();
+        int64_t time_since_last_attempt = ts_elapsed(now, precondition_last_attempt_ts);
+        if (to_send->identifier == 0x4E8U) {
+            set_0x4e8_distance_flag(
+                to_send,
+                SECONDS_UNTIL_STOP_RETRY(time_since_last_attempt),
+                // display retry count in tenths digit
+                precondition_retries % 10,
+                precondition_retries == 0 ? DIST_UNIT_FT : DIST_UNIT_MI,
+                FLAG_NONE
+            );
+            return FWD_MODIFIED;
+        }
+
+        if (to_send->identifier == 0x4CCU) {
+            to_send->data[0] = 0x02U;
+            return FWD_MODIFIED;
+        }
+    }
+
+    // otherwise, passthrough without modification
+    return FWD_PASSTHROUGH;
+}
+
+// same caching rationale as cached_precon_button_type
+static int8_t cached_precon_mode(void) {
+    static int8_t precon_mode = 0;
+    static bool loaded = false;
+    if (!loaded) {
+        precon_mode = config_server_precon_mode();
+        loaded = true;
+    }
+    return precon_mode;
+}
+
+// treat the car as in READY while the power status frame has never been seen,
+// so platforms without a decodable 0x038 keep the pre-power-tracking behavior
+static bool car_ready_or_unknown(void) {
+    return !power_status_available || car_in_ready;
+}
+
+static void start_preconditioning(int64_t now) {
+    precondition_requested = true;
+    precondition_requested_ts = now;
+    precondition_last_attempt_ts = now;
+    precondition_start_ticks_remaining = PRECONDITION_START_TICKS;
+    precondition_starting_confirmed = false;
+    precondition_started_confirmed = false;
+    precondition_retries = 0U;
+    precondition_keepalive_ts = now;
+    precondition_keepalive_ticks_remaining = 0U;
+    if(cached_precon_mode() != ONCE) {
+        precondition_BMU_managed = true;
+    }
+}
+
+static void stop_managing_preconditioning(int64_t now) {
+    precondition_requested = false;
+    precondition_last_attempt_ts = now;
+    // confirm stop so retry logic doesn't run
+    precondition_stop_confirmed = true;
+    precondition_retries = 0U;
+    // this just doesn't attempt to stop preconditoning
+    // and lets the BMU do what it wants once it reaches temp
+    precondition_stop_ticks_remaining = 0U;
+    // schedule the next keepalive burst relative to this handoff
+    precondition_keepalive_ts = now;
+    // keep track of whether we expect preconditioning
+    // to spontanouesly restart itself.
+    precondition_BMU_managed = true;
+}
+
+// fully reset to idle without sending stop messages: the car being off already
+// ended preconditioning, so there's nothing to stop on the bus
+static void abandon_preconditioning(int64_t now) {
+    stop_managing_preconditioning(now);
+    precondition_BMU_managed = false;
+}
+
+static void stop_preconditioning(int64_t now) {
+    precondition_requested = false;
+    precondition_last_attempt_ts = now;
+    precondition_stop_confirmed = false;
+    precondition_retries = 0U;
+    precondition_stop_ticks_remaining = PRECONDITION_STOP_TICKS;
+    precondition_keepalive_ticks_remaining = 0U;
+    precondition_BMU_managed = false;
+}
+
+// Cache the configured activation button type. A config change restarts the
+// whole firmware, so the value is effectively constant for the lifetime of
+// the process. Read it once on the first CAN message rather than on every frame.
+static int8_t cached_precon_button_type(void) {
+    static int8_t precon_button_type = 0;
+    static bool loaded = false;
+    if (!loaded) {
+        precon_button_type = config_server_precon_button();
+        loaded = true;
+    }
+    return precon_button_type;
+}
+
+// same caching rationale as cached_precon_button_type
+static int8_t cached_precon_press_type(void) {
+    static int8_t precon_press_type = PRESS_SHORT;
+    static bool loaded = false;
+    if (!loaded) {
+        precon_press_type = config_server_precon_press();
+        loaded = true;
+    }
+    return precon_press_type;
+}
+
+// toggle preconditioning on an activation event, with debounce between start and stop
+static void toggle_preconditioning(void) {
+    int64_t now = now_us();
+    // if preconditioning is either actively requested or BMU managed, the activation
+    // button should cancel it, not request it again
+    if (!precondition_requested && !precondition_BMU_managed) {
+        // reject activation while the car isn't in READY, but only once the
+        // power status frame has actually been seen on this platform
+        if (car_ready_or_unknown()) {
+            start_preconditioning(now);
+        }
+    } else if (ts_elapsed(now, precondition_requested_ts) > PRECONDITION_DEBOUNCE_US) {
+        stop_preconditioning(now);
+    }
+    // TODO(trh) we should handle the else case with an error message
+}
+
+void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
+    int64_t now = now_us();
+    if (IS_POWER_STATUS_FRAME(to_push->identifier)) {
+        power_status_available = true;
+        bool ready = POWER_STATUS_READY(to_push->data[0]);
+        if (ready && !car_in_ready) {
+            car_ready_ts = now;
+        }
+        car_in_ready = ready;
+    }
+    // 0x2AD/0x0A82AA03 status frame: second byte indicates precondition state
+    //   Ioniq 5/6: 0x01 = off/idle, 0x05 = starting, 0x15 = fully running
+    //   EV6: 0x41 = off/idle, 0x45 = starting, 0x55 = fully running
+    // only trust status frames coming from the car itself; a same-ID frame on
+    // the head unit bus must not drive the state machine
+    if (IS_STATUS_FRAME(to_push->identifier) && rx_bus == CAR_BUS) {
+        // we now know we have the status frame on the current car, so we should use it
+        status_frame_available = true;
+
+        uint8_t status = to_push->data[1];
+        // check if preconditioning is starting
+        if (precondition_requested && !precondition_starting_confirmed) {
+            if (STATUS_STARTING(status) || STATUS_STARTED(status)) {
+                precondition_starting_confirmed = true;
+            }
+        }
+        // check if preconditioning started
+        if (precondition_requested && !precondition_started_confirmed) {
+            if (STATUS_STARTED(status)) {
+                precondition_started_confirmed = true;
+            }
+        }
+        if (precondition_requested && precondition_started_confirmed) {
+            if (STATUS_STARTING(status)) {
+                // preconditioning was previously fully active, but now it's only showing as starting.
+                // this is a weird situation to be in; let's just reset the current attempt time,
+                // and let the retry logic continue as normal if it doesn't resolve itself after a while
+                precondition_last_attempt_ts = now;
+                precondition_started_confirmed = false;
+            }
+            if (STATUS_IDLE(status)) {
+                // preconditioning was previously fully active, but now it's showing as off.
+                // it's possible that the car has reached the "Precondition complete" state.
+                // until we have a better way to distinguish that state from a real failure mode (TODO(ejones)),
+                // let's just assume everything is fine and reset our state
+                if(precondition_BMU_managed) {
+                    stop_managing_preconditioning(now);
+                } else {
+                    // if we are in "once" mode, actually attempt to actively stop preconditioning.
+                    // this should prevent preconditioning from restarting once the battery falls back below temp.
+                    stop_preconditioning(now);
+                }
+            }
+        }
+        if (!precondition_requested && !precondition_stop_confirmed && precondition_stop_ticks_remaining == 0U) {
+            if (STATUS_IDLE(status)) {
+                precondition_stop_confirmed = true;
+            }
+        }
+    }
+
+    if (IS_BATTERY_TEMPERATURE_FRAME(to_push->identifier)
+            && rx_bus == CAR_BUS
+            && to_push->data_length_code >= BATTERY_TEMPERATURE_DATA_LENGTH) {
+        precondition_temperature_t temperature = {
+            .min_c = to_push->data[BATTERY_TEMPERATURE_MIN_INDEX],
+            .max_c = to_push->data[BATTERY_TEMPERATURE_MAX_INDEX],
+            .updated_at_us = esp_timer_get_time(),
+        };
+
+        xQueueOverwrite(battery_temperature_queue, &temperature);
+    }
+
+    // car off ends the session. persistent mode keeps BMU_managed set so the
+    // restart below re-requests on the next READY; continuous mode drops
+    // management entirely so the keepalive can't restart it next drive. other
+    // interruptions (e.g. nav in non-MITM) are re-requested by the keepalive burst
+    if (precondition_BMU_managed && !car_ready_or_unknown()) {
+        if (cached_precon_mode() != PERSISTENT) {
+            abandon_preconditioning(now);
+        } else if (precondition_requested) {
+            stop_managing_preconditioning(now);
+        }
+    }
+    // persistent mode: if the BMU was managing preconditioning when the car shut
+    // off, re-request it shortly after the car comes back to READY.
+    // TODO(ejones): requires manual activation after WiCAN power cycle (can be fixed by saving to flash)
+    if (cached_precon_mode() == PERSISTENT && precondition_BMU_managed && !precondition_requested
+            && car_in_ready && car_ready_ts > 0
+            && ts_elapsed(now, car_ready_ts) < PRECONDITION_RESTART_WINDOW_US) {
+        start_preconditioning(now);
+    }
+
+    int8_t precon_button_type = cached_precon_button_type();
+    if (precon_button_type == BUTTON_DISABLED) {
+        // activation button disabled in config; don't listen for any button press
+        return;
+    }
+    if (precon_button_type < 0 || precon_button_type >= NUM_PRECON_BUTTONS) {
+        ESP_LOGE(TAG, "Invalid precondition button type: %d", precon_button_type);
+        return;
+    }
+    // track activation button press/release edges. short press mode triggers on
+    // the release edge if the hold stayed under the threshold; long press mode
+    // triggers from precondition_tick once the hold crosses the threshold
+    const message_payload_t *button = &activation_messages[precon_button_type];
+    if (activation_is_press(button, to_push)) {
+        if (!activation_button_state_prev) {
+            activation_press_start_ts = now;
+            activation_long_press_fired = false;
+        }
+        activation_button_state_prev = true;
+    } else if (activation_is_release(button, to_push)) {
+        if (activation_button_state_prev
+                && cached_precon_press_type() == PRESS_SHORT
+                && ts_elapsed(now, activation_press_start_ts) < PRECONDITION_LONG_PRESS_US) {
+            toggle_preconditioning();
+        }
+        activation_button_state_prev = false;
+    }
+
+}
+
+// called every 40ms
+void precondition_tick(void) {
+    int64_t now = now_us();
+    int64_t time_since_last_attempt = ts_elapsed(now, precondition_last_attempt_ts);
+
+    // long press mode: trigger once when the hold crosses the threshold, without
+    // waiting for the release frame. state only becomes pressed via the rx hook,
+    // so this does nothing when the activation button is disabled
+    if (activation_button_state_prev && !activation_long_press_fired
+            && cached_precon_press_type() == PRESS_LONG
+            && ts_elapsed(now, activation_press_start_ts) >= PRECONDITION_LONG_PRESS_US) {
+        activation_long_press_fired = true;
+        toggle_preconditioning();
+    }
+
+    // we can only do retry logic if we know the status frame
+    if (status_frame_available) {
+        // give up and send one stop attempt if start retries exhausted
+        if (precondition_requested
+                && precondition_start_ticks_remaining == 0U
+                && precondition_retries >= PRECONDITION_MAX_RETRIES
+                && ((!precondition_starting_confirmed && time_since_last_attempt > PRECONDITION_RETRY_US)
+                    || (!precondition_started_confirmed && time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US))) {
+            if (precondition_BMU_managed) {
+                stop_managing_preconditioning(now);
+            } else {
+                stop_preconditioning(now);
+            }
+            precondition_retries = PRECONDITION_MAX_RETRIES;  // don't retry the stop; this is a failure case already
+        }
+
+        // retry start if not confirmed to be starting yet and it's been long enough
+        if (precondition_requested && !precondition_starting_confirmed
+                && precondition_start_ticks_remaining == 0U
+                && precondition_retries < PRECONDITION_MAX_RETRIES
+                && time_since_last_attempt > PRECONDITION_RETRY_US) {
+            precondition_last_attempt_ts = now;
+            precondition_start_ticks_remaining = PRECONDITION_START_TICKS;
+            precondition_retries++;
+        }
+
+        // retry start if not confirmed to be started yet and it's been long enough (i.e. we got 2AD 05 but not 15 after a long time)
+        if (precondition_requested && !precondition_started_confirmed
+                && precondition_start_ticks_remaining == 0U
+                && precondition_retries < PRECONDITION_MAX_RETRIES
+                && time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US) {
+            precondition_last_attempt_ts = now;
+            precondition_start_ticks_remaining = PRECONDITION_START_TICKS;
+            precondition_retries++;
+        }
+
+        // retry stop if not confirmed
+        if (!precondition_requested && !precondition_stop_confirmed
+                && !precondition_BMU_managed
+                && precondition_stop_ticks_remaining == 0U
+                && precondition_retries < PRECONDITION_MAX_RETRIES
+                && time_since_last_attempt > PRECONDITION_RETRY_US) {
+            precondition_last_attempt_ts = now;
+            precondition_stop_ticks_remaining = PRECONDITION_STOP_TICKS;
+            precondition_retries++;
+        }
+    } else if (precondition_requested && time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US) {
+        // if we don't have status messages, we still want to stop displaying the UI after 70 seconds
+        precondition_started_confirmed = true;
+    }
+
+    // while the BMU is managing preconditioning, periodically re-send the start
+    // burst so preconditioning is re-requested if it got dropped
+    if (precondition_BMU_managed && !precondition_requested && car_ready_or_unknown()
+            && ts_elapsed(now, precondition_keepalive_ts) > PRECONDITION_KEEPALIVE_US) {
+        precondition_keepalive_ts = now;
+        precondition_keepalive_ticks_remaining = PRECONDITION_START_TICKS;
+    }
+
+    // send initial burst of start messages
+    if (precondition_requested && precondition_start_ticks_remaining > 0U) {
+        send_precondition_start_msg(precondition_start_ticks_remaining);
+        precondition_start_ticks_remaining--;
+    }
+
+    // send keepalive burst of start messages
+    if (!precondition_requested && precondition_keepalive_ticks_remaining > 0U) {
+        send_precondition_start_msg(precondition_keepalive_ticks_remaining);
+        precondition_keepalive_ticks_remaining--;
+    }
+
+    // send initial burst of stop messages
+    if (!precondition_requested && precondition_stop_ticks_remaining > 0U) {
+        send_precondition_stop_msg(precondition_stop_ticks_remaining);
+        precondition_stop_ticks_remaining--;
+    }
+}
+
+bool precondition_get_battery_temperature(precondition_temperature_t *out) {
+    if (out == NULL || battery_temperature_queue == NULL) {
+        return false;
+    }
+
+    return xQueuePeek(battery_temperature_queue, out, 0) == pdTRUE;
+}

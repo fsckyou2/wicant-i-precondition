@@ -23,6 +23,15 @@
 #define __CAN_H__
 #include "driver/twai.h"
 
+/* The Pro has a single CAN transceiver, but the precondition code is written
+ * bus-aware so it can tell car traffic from anything else. Keep the enum so
+ * that identification stays explicit at the call sites. */
+typedef enum {
+	CAN_BUS_0 = 0,   /* on-chip TWAI controller (OBD-II pins 6/14) */
+} can_bus_t;
+
+#define CAN_BUS_COUNT		1
+
 #define CAN_5K				0
 #define CAN_10K				1
 #define CAN_20K				2

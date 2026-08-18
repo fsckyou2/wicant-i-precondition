@@ -54,6 +54,39 @@
 #define OBD_ELM327			3
 #define AUTO_PID			4
 
+/* How long preconditioning stays managed once requested */
+#define ONCE				0
+#define CONTINUOUS			1
+#define PERSISTENT			2
+
+/* Whether the activation button fires on release or once the hold passes 1s */
+#define PRESS_SHORT			0
+#define PRESS_LONG			1
+
+/* Which vehicle button activates preconditioning. SW_* are steering wheel
+ * buttons (0x448), AVN_* are head unit buttons (0x651/0x652). */
+#define BUTTON_DISABLED		-1
+#define SW_STAR				0
+#define AVN_STAR			1
+#define AVN_TUNER_IN		2
+#define AVN_VOL_IN			3
+#define SW_MODE				4
+#define SW_SPEAK			5
+#define SW_CALL				6
+#define SW_VOL_IN			7
+#define SW_VOL_UP			8
+#define SW_VOL_DOWN			9
+#define SW_SKIP_UP			10
+#define SW_SKIP_DOWN		11
+#define SW_OK				12
+#define AVN_MAP				13
+#define AVN_NAV				14
+#define AVN_MEDIA			15
+#define AVN_TUNER_UP		16
+#define AVN_TUNER_DOWN		17
+#define EV6_AVN_SETUP		18
+#define NUM_PRECON_BUTTONS	19
+
 typedef enum
 {
 	WIFI_OPEN,
@@ -165,6 +198,9 @@ typedef struct _device_config
 	char log_filesystem[16];
 	char log_period[16];
 	char imu_threshold[16];
+	char precon_mode[16];
+	char precon_button[32];
+	char precon_press[16];
 	bool debug_enabled;
 }device_config_t;
 
@@ -256,3 +292,6 @@ const char *config_server_get_sta_fallback_ssid(int index);
 const char *config_server_get_sta_fallback_pass(int index);
 wifi_security_t config_server_get_sta_fallback_security(int index);
 char *config_server_get_status_json(bool remove_sensitive_info);
+int8_t config_server_precon_button(void);
+int8_t config_server_precon_mode(void);
+int8_t config_server_precon_press(void);
