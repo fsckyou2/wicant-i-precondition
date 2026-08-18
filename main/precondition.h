@@ -2,6 +2,7 @@
 #define __PRECONDITION_H__
 
 #include "driver/twai.h"
+#include "can.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -12,6 +13,7 @@ typedef enum {
 } fwd_result_t;
 
 void precondition_init(void);
+bool precondition_bus_identified(void);
 void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus);
 fwd_result_t precondition_fwd_hook(twai_message_t *to_send, can_bus_t fwd_bus);
 void precondition_tick(void);

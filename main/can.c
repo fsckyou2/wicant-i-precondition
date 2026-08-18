@@ -390,6 +390,23 @@ esp_err_t can_send(twai_message_t *message, TickType_t ticks_to_wait)
 	else return ESP_ERR_INVALID_STATE;
 }
 
+/* True when the bus can actually carry traffic right now.
+ *
+ * This is a different question from can_is_enabled(). That one reports
+ * bus_state, i.e. whether the driver is installed and started. This one
+ * reports CAN_ENABLE_BIT, which is the gate can_receive() and can_send()
+ * really honour. can_block() clears that bit but leaves bus_state at ON_BUS,
+ * so the two disagree whenever the bus is blocked rather than shut down.
+ *
+ * A caller with other periodic work to do must check this before calling
+ * can_receive(): that function waits on the bit with portMAX_DELAY no matter
+ * what ticks_to_wait it was given, so its timeout cannot be relied on to hand
+ * control back while the bit is clear. */
+bool can_is_ready(void)
+{
+	return (xEventGroupGetBits(s_can_event_group) & CAN_ENABLE_BIT) != 0;
+}
+
 bool can_is_enabled(void)
 {
 	if(can_cfg.bus_state == ON_BUS)

@@ -82,6 +82,11 @@ static int64_t activation_press_start_ts = 0U;
 static bool activation_long_press_fired = false;
 // is the status frame available? false if on unknown platform, true if we at any point receive a known status frame
 static bool status_frame_available = false;
+// set once we have decoded a frame that only an E-GMP car emits. two things
+// follow from that: the configured bitrate matches the bus, because a frame
+// cannot be decoded at the wrong one, and this is a car we have reason to
+// send 0x0C7 to. can_rx_task waits for both before it leaves listen-only
+static bool bus_identified = false;
 
 static QueueHandle_t battery_temperature_queue = NULL;
 
@@ -449,8 +454,31 @@ static void toggle_preconditioning(void) {
     // TODO(trh) we should handle the else case with an error message
 }
 
+// Match a frame id against the frames that carry the configurable activation
+// buttons. Scans activation_messages instead of repeating the ids here, so
+// adding a button to that table cannot leave this check out of date.
+static bool is_activation_frame(uint32_t frame_id) {
+    for (size_t i = 0U; i < NUM_PRECON_BUTTONS; i++) {
+        if (activation_messages[i].frame_id == frame_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool precondition_bus_identified(void) {
+    return bus_identified;
+}
+
 void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
     int64_t now = now_us();
+    if (!bus_identified
+            && (IS_STATUS_FRAME(to_push->identifier)
+                || IS_POWER_STATUS_FRAME(to_push->identifier)
+                || IS_BATTERY_TEMPERATURE_FRAME(to_push->identifier)
+                || is_activation_frame(to_push->identifier))) {
+        bus_identified = true;
+    }
     if (IS_POWER_STATUS_FRAME(to_push->identifier)) {
         power_status_available = true;
         bool ready = POWER_STATUS_READY(to_push->data[0]);

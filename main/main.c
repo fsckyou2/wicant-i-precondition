@@ -363,6 +363,14 @@ static void can_tx_task(void *pvParameters)
 #define HEAP_CAPS   (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
 #define PRECONDITION_TICK_PERIOD_US 40000
 
+// Whether the listen-only mode currently on the bus is ours to lift. Set only
+// when preconditioning is what brought the bus up, which is the one case where
+// changing the mode steps on nobody: if a host protocol had already enabled the
+// bus, or the user asked for silent mode, this stays false and the bus is left
+// exactly as configured. Cleared when can_rx_task promotes to normal, so the
+// promotion happens once per bring-up.
+static bool precon_listen_only = false;
+
 static void can_rx_task(void *pvParameters)
 {
 //	static uint32_t num_msg = 0;
@@ -410,6 +418,27 @@ static void can_rx_task(void *pvParameters)
 		{
 			precondition_tick_last = esp_timer_get_time();
 			precondition_tick();
+		}
+
+		// can_receive() parks forever while the bus is down, which would stop the
+		// tick above from ever running again. Nothing to drain in that case, so
+		// idle here instead of blocking in the driver.
+		if(!can_is_ready())
+		{
+			vTaskDelay(pdMS_TO_TICKS(10));
+			continue;
+		}
+
+		// Brought up listen-only (see app_main); a decoded E-GMP frame proves the
+		// bitrate and the bus, so it is now safe to start transmitting.
+		if(precon_listen_only && precondition_bus_identified())
+		{
+			precon_listen_only = false;
+			ESP_LOGW(TAG, "precondition: bus identified, leaving listen-only");
+			can_disable();
+			can_set_silent(0);
+			can_enable();
+			continue;
 		}
 
         while(can_receive(&rx_msg, 0) ==  ESP_OK)
@@ -1016,6 +1045,30 @@ void app_main(void)
 //
 //		mqtt_init((char*)&uid[0], CONNECTED_LED_GPIO_NUM, &xmsg_mqtt_rx_queue);
 //	}
+	// Preconditioning has to watch the bus regardless of which host protocol is
+	// selected, and on the Pro the ELM327/AutoPID paths go through the OBD chip
+	// rather than the ESP's own TWAI, so nothing above may have enabled it.
+	// Come up listen-only: a wrong bitrate, or a car that isn't an E-GMP one,
+	// then can't disturb the bus. can_rx_task promotes us out of listen-only
+	// once it decodes a frame that only an E-GMP car emits.
+	if(config_server_precon_button() != BUTTON_DISABLED && !can_is_enabled())
+	{
+		if(config_server_get_can_mode() == CAN_SILENT)
+		{
+			// user asked for a listen-only device; honour that and never promote
+			can_set_silent(1);
+			can_enable();
+			ESP_LOGW(TAG, "precondition: CAN mode is silent, start/stop disabled");
+		}
+		else
+		{
+			can_set_silent(1);
+			can_enable();
+			precon_listen_only = true;
+			ESP_LOGI(TAG, "precondition: bus up listen-only, waiting to identify car");
+		}
+	}
+
 	vehicle_config_t vehicle_config;
 	if(config_server_get_sleep_volt(&vehicle_config.voltage_at_ignition) == -1)
 	{

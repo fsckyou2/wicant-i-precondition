@@ -72,6 +72,7 @@ esp_err_t can_send(twai_message_t *message, TickType_t ticks_to_wait);
 void can_init(uint8_t bitrate);
 uint8_t can_is_silent(void);
 bool can_is_enabled(void);
+bool can_is_ready(void);
 uint8_t can_get_bitrate(void);
 uint32_t can_msgs_to_rx(void);
 
