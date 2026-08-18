@@ -3035,16 +3035,16 @@ static void config_server_load_cfg(char *cfg)
 	//*****
 
 	//*****
-	// The precon_* keys are absent from configs written by stock firmware, so
-	// fall back to the defaults rather than rejecting the whole config.
+	// The precon_* keys are absent from configs written by stock firmware, and
+	// an over-length value is nothing worse than a bad setting, so fall back to
+	// the default in both cases. Rejecting the config here would send us to
+	// config_error, which deletes config.json and reboots, taking the wifi and
+	// mqtt credentials with it.
 	key = cJSON_GetObjectItem(root,"precon_mode");
-	if(key == 0 || key->valuestring == NULL)
+	if(key == 0 || key->valuestring == NULL
+			|| strlen(key->valuestring) > sizeof(device_config.precon_mode) - 1)
 	{
 		strlcpy(device_config.precon_mode, "once", sizeof(device_config.precon_mode));
-	}
-	else if(strlen(key->valuestring) > sizeof(device_config.precon_mode))
-	{
-		goto config_error;
 	}
 	else
 	{
@@ -3055,13 +3055,10 @@ static void config_server_load_cfg(char *cfg)
 
 	//*****
 	key = cJSON_GetObjectItem(root,"precon_button");
-	if(key == 0 || key->valuestring == NULL)
+	if(key == 0 || key->valuestring == NULL
+			|| strlen(key->valuestring) > sizeof(device_config.precon_button) - 1)
 	{
 		strlcpy(device_config.precon_button, "sw_star", sizeof(device_config.precon_button));
-	}
-	else if(strlen(key->valuestring) > sizeof(device_config.precon_button))
-	{
-		goto config_error;
 	}
 	else
 	{
@@ -3072,13 +3069,10 @@ static void config_server_load_cfg(char *cfg)
 
 	//*****
 	key = cJSON_GetObjectItem(root,"precon_press");
-	if(key == 0 || key->valuestring == NULL)
+	if(key == 0 || key->valuestring == NULL
+			|| strlen(key->valuestring) > sizeof(device_config.precon_press) - 1)
 	{
 		strlcpy(device_config.precon_press, "short", sizeof(device_config.precon_press));
-	}
-	else if(strlen(key->valuestring) > sizeof(device_config.precon_press))
-	{
-		goto config_error;
 	}
 	else
 	{

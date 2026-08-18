@@ -120,7 +120,9 @@ typedef struct {
 // map of the buttons that can be used to activate preconditioning.
 // note: SW buttons (0x448) have a periodic idle message;
 //       AVN buttons (0x651/0x652) only send on press/release.
-const static message_payload_t activation_messages[NUM_PRECON_BUTTONS] = {
+// Sized from the initializers rather than declared as [NUM_PRECON_BUTTONS], so
+// that the assert below can catch a button missing off the end of the table.
+const static message_payload_t activation_messages[] = {
     [SW_STAR]         = {0x448, MSG_STATE, .state = {5, 0xF0, 0x10}},
     [AVN_STAR]        = {0x652, MSG_EVENT,  .pair  = {1, 0x0F, {0x04, 0x07}, {0x00, 0x03}}},
     [AVN_TUNER_IN]    = {0x651, MSG_EVENT,  .pair  = {3, 0xF0, {0x40, 0x70}, {0x00, 0x30}}},
@@ -242,6 +244,28 @@ static int64_t ts_elapsed(int64_t now, int64_t old) {
 void precondition_init(void) {
     battery_temperature_queue = xQueueCreate(1, sizeof(precondition_temperature_t));
     configASSERT(battery_temperature_queue != NULL);
+
+    // A button missing from the middle of activation_messages leaves a zeroed
+    // entry, and a zero mask matches every frame, which would read as that
+    // button being held down from boot. The size assert cannot see a gap, only
+    // a short table, so check the ids here.
+    for (size_t i = 0U; i < NUM_PRECON_BUTTONS; i++) {
+        configASSERT(activation_messages[i].frame_id != 0U);
+    }
+}
+
+// Put a command frame on the bus. Losing one is recoverable, since the status
+// frame then never confirms and precondition_tick sends a fresh burst, but it
+// is worth saying so: otherwise the retry looks unprovoked in the log. Rate
+// limited because a bus that is down drops every frame of every burst.
+static void send_precondition_msg(twai_message_t *packet) {
+    if (can_send(packet, 1) == ESP_OK) {
+        return;
+    }
+    static uint32_t drop_cnt = 0;
+    if ((++drop_cnt % 16U) == 1U) {
+        ESP_LOGW(TAG, "precondition: %lu command frames dropped", (unsigned long)drop_cnt);
+    }
 }
 
 static void send_precondition_start_msg(uint8_t ticks_remaining) {
@@ -258,7 +282,7 @@ static void send_precondition_start_msg(uint8_t ticks_remaining) {
         packet.data[4] = 0x07U;
     }
     // TODO(ejones): ensure that blocking for 1 tick is the right move here and elsewhere
-    can_send(&packet, 1);
+    send_precondition_msg(&packet);
 }
 
 static void send_precondition_stop_msg(uint8_t ticks_remaining) {
@@ -270,7 +294,7 @@ static void send_precondition_stop_msg(uint8_t ticks_remaining) {
         packet.data[3] = 0xE0U;
         packet.data[4] = 0x07U;
     }
-    can_send(&packet, 1);
+    send_precondition_msg(&packet);
 }
 
 // Decide whether to block, modify, or passthrough a message for preconditioning.
