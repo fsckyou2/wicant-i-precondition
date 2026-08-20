@@ -478,29 +478,19 @@ static void toggle_preconditioning(void) {
     // TODO(trh) we should handle the else case with an error message
 }
 
-// Match a frame id against the frames that carry the configurable activation
-// buttons. Scans activation_messages instead of repeating the ids here, so
-// adding a button to that table cannot leave this check out of date.
-static bool is_activation_frame(uint32_t frame_id) {
-    for (size_t i = 0U; i < NUM_PRECON_BUTTONS; i++) {
-        if (activation_messages[i].frame_id == frame_id) {
-            return true;
-        }
-    }
-    return false;
-}
-
 bool precondition_bus_identified(void) {
     return bus_identified;
 }
 
 void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
     int64_t now = now_us();
-    if (!bus_identified
-            && (IS_STATUS_FRAME(to_push->identifier)
-                || IS_POWER_STATUS_FRAME(to_push->identifier)
-                || IS_BATTERY_TEMPERATURE_FRAME(to_push->identifier)
-                || is_activation_frame(to_push->identifier))) {
+    // Only the status frame is specific enough to promote on. The button,
+    // power and temperature ids are all short and unremarkable, and a car that
+    // is not an E-GMP one could plausibly use any of them, which would put us
+    // on a stranger's bus in normal mode. 0x0A82AA03 is a 29-bit id and 0x2AD
+    // is narrow enough; both are measured at about 5 frames/s, so this still
+    // promotes within a fraction of a second on a car we do belong on.
+    if (!bus_identified && IS_STATUS_FRAME(to_push->identifier)) {
         bus_identified = true;
     }
     if (IS_POWER_STATUS_FRAME(to_push->identifier)) {
