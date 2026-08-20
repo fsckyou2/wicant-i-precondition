@@ -71,12 +71,14 @@ static uint8_t datarate = CAN_500K;
 //static uint32_t filter = 0;
 static can_cfg_t can_cfg = {.bus_state = END_BUS, .auto_bitrate = 0};
 
-#define TWAI_CONFIG(tx_io_num, rx_io_num, op_mode) {.mode = op_mode, .tx_io = tx_io_num, .rx_io = rx_io_num,        \
-                                                                    .clkout_io = TWAI_IO_UNUSED, .bus_off_io = TWAI_IO_UNUSED,      \
-                                                                    .tx_queue_len = 100, .rx_queue_len = 100,                           \
-                                                                    .alerts_enabled = TWAI_ALERT_NONE,  .clkout_divider = 0,        \
-                                                                    .intr_flags = ESP_INTR_FLAG_LEVEL1}
-
+/* TWAI_GENERAL_CONFIG_DEFAULT gives 5 slots each way. A measured E-GMP M-CAN
+ * runs about 2300 frames/s, so five slots is a 2 ms cushion: one preemption of
+ * can_rx_task and frames are lost, which for preconditioning means missed
+ * status frames and retries that look unprovoked. 64 slots buys ~28 ms at that
+ * rate and costs a few hundred bytes. TX is smaller because we transmit rarely,
+ * but still needs slack for a burst that lands while the bus is busy. */
+#define CAN_RX_QUEUE_LEN	64
+#define CAN_TX_QUEUE_LEN	32
 
 static twai_general_config_t g_config_normal = TWAI_GENERAL_CONFIG_DEFAULT(TX_GPIO_NUM, RX_GPIO_NUM, TWAI_MODE_NORMAL);
 static twai_general_config_t g_config_silent = TWAI_GENERAL_CONFIG_DEFAULT(TX_GPIO_NUM, RX_GPIO_NUM, TWAI_MODE_LISTEN_ONLY);
@@ -133,6 +135,10 @@ void can_enable(void)
 	f_config.single_filter = 1;
 	g_config_silent.intr_flags = ESP_INTR_FLAG_LEVEL3 | ESP_INTR_FLAG_SHARED;
 	g_config_normal.intr_flags = ESP_INTR_FLAG_LEVEL3 | ESP_INTR_FLAG_SHARED;
+	g_config_silent.rx_queue_len = CAN_RX_QUEUE_LEN;
+	g_config_normal.rx_queue_len = CAN_RX_QUEUE_LEN;
+	g_config_silent.tx_queue_len = CAN_TX_QUEUE_LEN;
+	g_config_normal.tx_queue_len = CAN_TX_QUEUE_LEN;
 	if(can_cfg.silent)
 	{
 		if(twai_driver_install(&g_config_silent, (const twai_timing_config_t *)t_config, &f_config) == ESP_OK)
