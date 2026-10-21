@@ -28,6 +28,7 @@
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <string.h>
 #include "comm_server.h"
 #include "lwip/sockets.h"
@@ -85,6 +86,16 @@ static twai_general_config_t g_config_silent = TWAI_GENERAL_CONFIG_DEFAULT(TX_GP
 //static const twai_general_config_t g_config_no_ack = TWAI_GENERAL_CONFIG_DEFAULT(TX_GPIO_NUM, RX_GPIO_NUM, TWAI_MODE_NO_ACK);
 
 static twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+/* Frames lost on either path used to vanish without a trace. Both are logged
+ * at most once a second so a bus that is down, or a receiver that has fallen
+ * behind, can't flood the log. */
+#define CAN_DROP_LOG_INTERVAL_US	1000000
+
+/* TX frames refused by can_send(), whether the bus was down or the driver
+ * couldn't take the frame within the caller's timeout. */
+static uint32_t tx_drop_count;
+static int64_t tx_drop_log_us;
 
 //block tx/rx
 void can_block(void)
@@ -319,6 +330,55 @@ void can_init(uint8_t bitrate)
 }
 
 
+/* The legacy driver already counts RX frames it loses: rx_missed_count when
+ * its rx queue is full because we aren't draining it fast enough, and
+ * rx_overrun_count when the hardware FIFO overflows before the ISR gets to
+ * it. Nothing ever looked at them, so poll them here, from task context, and
+ * report when they move. */
+static void can_log_rx_drops(void)
+{
+	static int64_t check_us;
+	static uint32_t logged;
+	int64_t now = esp_timer_get_time();
+
+	if(now - check_us < CAN_DROP_LOG_INTERVAL_US)
+	{
+		return;
+	}
+	check_us = now;
+
+	twai_status_info_t status_info;
+	if(twai_get_status_info(&status_info) != ESP_OK)
+	{
+		return;
+	}
+
+	uint32_t dropped = status_info.rx_missed_count + status_info.rx_overrun_count;
+	// The counters start over each time the driver is reinstalled.
+	if(dropped < logged)
+	{
+		logged = 0;
+	}
+	if(dropped != logged)
+	{
+		logged = dropped;
+		ESP_LOGW(TAG, "rx: %lu frames dropped since the bus came up (queue full %lu, fifo overrun %lu)",
+				 dropped, status_info.rx_missed_count, status_info.rx_overrun_count);
+	}
+}
+
+static void can_count_tx_drop(esp_err_t err)
+{
+	tx_drop_count++;
+	int64_t now = esp_timer_get_time();
+	if(now - tx_drop_log_us > CAN_DROP_LOG_INTERVAL_US)
+	{
+		tx_drop_log_us = now;
+		ESP_LOGW(TAG, "tx: frame dropped (%s), %lu dropped in total",
+				 esp_err_to_name(err), tx_drop_count);
+	}
+}
+
 esp_err_t can_receive(twai_message_t *message, TickType_t ticks_to_wait)
 {
 	esp_err_t ret;
@@ -331,6 +391,8 @@ esp_err_t can_receive(twai_message_t *message, TickType_t ticks_to_wait)
 							pdFALSE,
 							pdFALSE,
 							portMAX_DELAY);
+
+	can_log_rx_drops();
 
 	// if(can_cfg.auto_bitrate)
 	// {
@@ -388,12 +450,17 @@ esp_err_t can_send(twai_message_t *message, TickType_t ticks_to_wait)
 //							pdFALSE,
 //							portMAX_DELAY);
 	EventBits_t uxBits = xEventGroupGetBits(s_can_event_group);
+	esp_err_t ret = ESP_ERR_INVALID_STATE;
 
 	if(uxBits & CAN_ENABLE_BIT)
 	{
-		return twai_transmit(message, ticks_to_wait);
+		ret = twai_transmit(message, ticks_to_wait);
 	}
-	else return ESP_ERR_INVALID_STATE;
+	if(ret != ESP_OK)
+	{
+		can_count_tx_drop(ret);
+	}
+	return ret;
 }
 
 /* True when the bus can actually carry traffic right now.
