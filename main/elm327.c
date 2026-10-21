@@ -724,7 +724,7 @@ static void elm327_send_flow_control_frame(twai_message_t *first_frame)
 		elm327_can_log(&txframe, ELM327_CAN_TX);
 	}
 	
-	can_send(&txframe, 1);
+	can_send(CAN_BUS_0, &txframe, 1);
 }
 
 static int8_t elm327_request(char *cmd, char *rsp, QueueHandle_t *queue)
@@ -819,7 +819,7 @@ static int8_t elm327_request(char *cmd, char *rsp, QueueHandle_t *queue)
 	{
 		elm327_can_log(&txframe, ELM327_CAN_TX);
 	}
-	can_send(&txframe, 1);
+	can_send(CAN_BUS_0, &txframe, 1);
 	TickType_t xtimeout = (elm327_config.req_timeout*4.096) / portTICK_PERIOD_MS;
 	TickType_t xwait_time;
 	int64_t txtime = esp_timer_get_time();

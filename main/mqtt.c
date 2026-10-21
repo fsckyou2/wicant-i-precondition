@@ -299,7 +299,7 @@ static void mqtt_parse_data(void *handler_args, esp_event_base_t base, int32_t e
             }
             can_frame.self = 0;
             // can_enable();
-            can_send(&can_frame, 1);
+            can_send(CAN_BUS_0, &can_frame, 1);
         }
     }
     else if (event->topic && (event->topic_len == (int)strlen(mqtt_cmd_topic)) &&

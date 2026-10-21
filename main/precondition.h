@@ -2,7 +2,6 @@
 #define __PRECONDITION_H__
 
 #include "driver/twai.h"
-#include "can.h"
 #include <stdbool.h>
 #include <stdint.h>
 

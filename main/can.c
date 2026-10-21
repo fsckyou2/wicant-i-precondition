@@ -448,8 +448,16 @@ esp_err_t can_receive(twai_message_t *message, TickType_t ticks_to_wait)
 	}
 }
 
-esp_err_t can_send(twai_message_t *message, TickType_t ticks_to_wait)
+/* bus is taken so callers read the same as on main's multi-bus builds, where
+ * shared code such as precondition.c names the bus it sends on. The Pro has
+ * only CAN_BUS_0. */
+esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait)
 {
+	if(bus != CAN_BUS_0)
+	{
+		return ESP_ERR_INVALID_ARG;
+	}
+
 //	xEventGroupWaitBits(s_can_event_group,
 //							CAN_ENABLE_BIT,
 //							pdFALSE,

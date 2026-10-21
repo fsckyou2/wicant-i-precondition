@@ -68,7 +68,7 @@ void can_set_filter(uint32_t f);
 void can_set_mask(uint32_t m);
 void can_set_bitrate(uint8_t rate);
 esp_err_t can_receive(twai_message_t *message, TickType_t ticks_to_wait);
-esp_err_t can_send(twai_message_t *message, TickType_t ticks_to_wait);
+esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait);
 void can_init(uint8_t bitrate);
 uint8_t can_is_silent(void);
 bool can_is_enabled(void);

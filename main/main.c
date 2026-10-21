@@ -311,7 +311,7 @@ static void can_tx_task(void *pvParameters)
 			}
 
 			tx_msg.self = 0;
-			can_send(&tx_msg, portMAX_DELAY);
+			can_send(CAN_BUS_0, &tx_msg, portMAX_DELAY);
 		}
 		else if(protocol == SAVVYCAN)
 		{
@@ -460,7 +460,7 @@ static void can_rx_task(void *pvParameters)
 				twai_message_t fwd_msg = rx_msg;
 
 				if(precondition_fwd_hook(&fwd_msg, CAN_BUS_0) == FWD_MODIFIED
-						&& can_send(&fwd_msg, 1) != ESP_OK)
+						&& can_send(CAN_BUS_0, &fwd_msg, 1) != ESP_OK)
 				{
 					static uint32_t fwd_drop_cnt = 0;
 

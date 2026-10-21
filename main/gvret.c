@@ -384,7 +384,7 @@ void gvret_parse(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHandle_t
 						// wire rate through TCP backpressure instead of
 						// dropping, and short enough to stay bounded on a sick
 						// bus. can_send() counts and logs anything it drops.
-						can_send(frame, pdMS_TO_TICKS(20));
+						can_send(CAN_BUS_0, frame, pdMS_TO_TICKS(20));
 //						if (out_bus == 0) canManager.sendFrame(&CAN0, build_out_frame);
 //						if (out_bus == 1) canManager.sendFrame(&CAN1, build_out_frame);
 					}
