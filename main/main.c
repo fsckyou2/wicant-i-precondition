@@ -461,7 +461,15 @@ static void can_rx_task(void *pvParameters)
 			continue;
 		}
 
-        while(can_receive(&rx_msg, 0) ==  ESP_OK)
+		// Wait up to 10 ms for the first frame, then drain the backlog without
+		// waiting. The bound keeps the 40 ms precondition tick above running on
+		// a quiet bus, and blocking at all is what makes priority 7 safe: this
+		// task only outranks the TCP tasks while there is frame work to do.
+        if(can_receive(&rx_msg, pdMS_TO_TICKS(10)) != ESP_OK)
+        {
+            continue;
+        }
+        do
         {
 //        	num_msg++;
 
@@ -566,8 +574,7 @@ static void can_rx_task(void *pvParameters)
 					xQueueSend( xmsg_mqtt_rx_queue, ( void * ) &mqtt_rx_msg, pdMS_TO_TICKS(0) );
 				}
 			}
-        }
-        vTaskDelay(pdMS_TO_TICKS(1));
+        } while(can_receive(&rx_msg, 0) == ESP_OK);
 	}
 }
 
@@ -1193,7 +1200,10 @@ void app_main(void)
 
 	if (can_rx_task_stack != NULL && can_tx_task_stack != NULL && obd_rx_task_stack != NULL) 
 	{
-		xTaskCreateStatic(can_rx_task, "can_rx_task", can_task_stack_depth_words, (void*)AF_INET, 5, 
+		// Priority 7 so the CAN datapath preempts the TCP streaming tasks (5)
+		// rather than timeslicing with them. Only safe because can_rx_task
+		// blocks in can_receive() when the bus is idle.
+		xTaskCreateStatic(can_rx_task, "can_rx_task", can_task_stack_depth_words, (void*)AF_INET, 7,
 						can_rx_task_stack, &can_rx_task_buffer);
 		xTaskCreateStatic(can_tx_task, "can_tx_task", can_task_stack_depth_words, (void*)AF_INET, 5, 
 						can_tx_task_stack, &can_tx_task_buffer);
