@@ -532,7 +532,18 @@ static void can_rx_task(void *pvParameters)
 				{
 					if(tcp_port_open())
 					{
-						xQueueSend( xMsg_Tx_Queue, ( void * ) &ucTCP_TX_Buffer, pdMS_TO_TICKS(0) );
+						// Zero timeout so a stalled TCP session can never hold
+						// up CAN rx, but count what that costs.
+						if(xQueueSend( xMsg_Tx_Queue, ( void * ) &ucTCP_TX_Buffer, pdMS_TO_TICKS(0) ) != pdTRUE)
+						{
+							static uint32_t host_drop_cnt = 0;
+
+							if((++host_drop_cnt % 64U) == 1U)
+							{
+								ESP_LOGW(TAG, "host stream: %lu frames dropped (TX queue full)",
+										 (unsigned long)host_drop_cnt);
+							}
+						}
 					}
 					if(ble_connected() && protocol != OBD_ELM327 && protocol != AUTO_PID)
 					{
@@ -824,6 +835,10 @@ void app_main(void)
     xMsg_Tx_Queue = xQueueCreate(32, sizeof( xdev_buffer) );
     xmsg_ws_tx_queue = xQueueCreate(32, sizeof( xdev_buffer) );
 	#elif HARDWARE_VER == WICAN_PRO
+	// The host TX queue absorbs CAN traffic while a send() to the client is
+	// stalled on wifi retries or a full lwip buffer, so give it room to ride
+	// those out: 128 items, about 130 KB of PSRAM at 1 KB per item.
+	#define HOST_TX_QUEUE_LEN	128
 	static xdev_buffer* xMsg_Rx_Queue_Storage;
 	static xdev_buffer* xMsg_Tx_Queue_Storage;
 	static xdev_buffer* xmsg_ws_tx_queue_Storage;
@@ -834,7 +849,7 @@ void app_main(void)
 	size_t xdev_buffer_size = sizeof( xdev_buffer);
 	
     xMsg_Rx_Queue_Storage = (xdev_buffer *)heap_caps_malloc(32 * xdev_buffer_size, MALLOC_CAP_SPIRAM);
-    xMsg_Tx_Queue_Storage = (xdev_buffer *)heap_caps_malloc(32 * xdev_buffer_size, MALLOC_CAP_SPIRAM);
+    xMsg_Tx_Queue_Storage = (xdev_buffer *)heap_caps_malloc(HOST_TX_QUEUE_LEN * xdev_buffer_size, MALLOC_CAP_SPIRAM);
     xmsg_ws_tx_queue_Storage = (xdev_buffer *)heap_caps_malloc(32 * xdev_buffer_size, MALLOC_CAP_SPIRAM);
 
     // Check if memory allocation was successful
@@ -846,7 +861,7 @@ void app_main(void)
 
     // Create the static queues
     xMsg_Rx_Queue = xQueueCreateStatic(32, xdev_buffer_size, (uint8_t *)xMsg_Rx_Queue_Storage, &xMsg_Rx_Queue_Buffer);
-    xMsg_Tx_Queue = xQueueCreateStatic(32, xdev_buffer_size, (uint8_t *)xMsg_Tx_Queue_Storage, &xMsg_Tx_Queue_Buffer);
+    xMsg_Tx_Queue = xQueueCreateStatic(HOST_TX_QUEUE_LEN, xdev_buffer_size, (uint8_t *)xMsg_Tx_Queue_Storage, &xMsg_Tx_Queue_Buffer);
     xmsg_ws_tx_queue = xQueueCreateStatic(32, xdev_buffer_size, (uint8_t *)xmsg_ws_tx_queue_Storage, &xmsg_ws_tx_queue_Buffer);
 
     // Check if queues were created successfully
