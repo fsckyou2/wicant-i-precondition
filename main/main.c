@@ -429,6 +429,26 @@ static void can_rx_task(void *pvParameters)
 			continue;
 		}
 
+		// Nothing brings the controller back from bus-off on its own, so it
+		// would sit dead until a reboot. Reinstall it, after a pause that lets
+		// the bus settle and keeps a persistent fault (a shorted bus, a wrong
+		// bitrate) from turning this into a tight loop.
+		if(can_is_bus_off())
+		{
+			static uint32_t busoff_cnt = 0;
+
+			ESP_LOGW(TAG, "CAN bus-off #%lu, restarting the controller", (unsigned long)++busoff_cnt);
+			can_disable();
+			vTaskDelay(pdMS_TO_TICKS(250));
+			// Going to sleep clears DEV_AWAKE_BIT before it takes the bus down;
+			// don't bring the bus back up underneath it.
+			if(dev_status_is_bit_set(DEV_AWAKE_BIT))
+			{
+				can_enable();
+			}
+			continue;
+		}
+
 		// Brought up listen-only (see app_main); a decoded E-GMP frame proves the
 		// bitrate and the bus, so it is now safe to start transmitting.
 		if(precon_listen_only && precondition_bus_identified())

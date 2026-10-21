@@ -201,7 +201,13 @@ void can_disable(void)
 	{
 		gpio_set_level(CAN_STDBY_GPIO_NUM, 1);
 		can_block();
-		if(twai_stop() == ESP_OK)
+		// A controller in bus-off has already halted and twai_stop() refuses
+		// it, but twai_driver_uninstall() takes it as it is.
+		if(can_is_bus_off())
+		{
+			ESP_LOGI(TAG, "twai bus-off, nothing to stop");
+		}
+		else if(twai_stop() == ESP_OK)
 		{
 			ESP_LOGI(TAG, "stop twai");
 		}
@@ -478,6 +484,20 @@ esp_err_t can_send(twai_message_t *message, TickType_t ticks_to_wait)
 bool can_is_ready(void)
 {
 	return (xEventGroupGetBits(s_can_event_group) & CAN_ENABLE_BIT) != 0;
+}
+
+/* True when the controller has gone bus-off. The driver never recovers from
+ * that by itself: until something reinstalls it there is no rx, and every
+ * can_send() fails. */
+bool can_is_bus_off(void)
+{
+	twai_status_info_t status_info;
+
+	if(can_cfg.bus_state != ON_BUS)
+	{
+		return false;
+	}
+	return twai_get_status_info(&status_info) == ESP_OK && status_info.state == TWAI_STATE_BUS_OFF;
 }
 
 bool can_is_enabled(void)
