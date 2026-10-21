@@ -30,6 +30,7 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "driver/gpio.h"
+#include "esp_timer.h"
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
@@ -182,10 +183,22 @@ static void tcp_server_tx_task(void *pvParameters)
 {
 //	int addr_family = (int)pvParameters;
 	static xdev_buffer tx_buffer;
+	// Sending one queue item per send() can't keep up with a busy bus: every
+	// ~20 byte GVRET frame pays a full round trip through the lwip tcpip
+	// thread. Pack whatever is queued into one MSS-sized segment instead. All
+	// the stream protocols (gvret/slcan/elm327) cope with any segmentation.
+	static uint8_t coalesce_buf[CONFIG_LWIP_TCP_MSS];
+	_Static_assert(DEV_BUFFER_LENGTH <= sizeof(coalesce_buf), "a queue item must fit in one segment");
+	// Set when the last item drained didn't fit; it starts the next segment.
+	bool carried = false;
 
 	while(1)
 	{
-		xQueueReceive(*xTX_Queue, ( void * ) &tx_buffer, portMAX_DELAY);
+		if (!carried)
+		{
+			xQueueReceive(*xTX_Queue, ( void * ) &tx_buffer, portMAX_DELAY);
+		}
+		carried = false;
 
 		// Nobody connected: throw the frame away. Leaving it queued would back
 		// up send_to_host() and can_tx_task long after the disconnect, and the
@@ -195,12 +208,32 @@ static void tcp_server_tx_task(void *pvParameters)
 			continue;
 		}
 
+		// Items on the Pro can be up to DEV_BUFFER_LENGTH (1 KB), so check each
+		// one's real length rather than reserving room for the worst case,
+		// which would leave space for barely a couple of dozen frames.
+		int bytes_used = tx_buffer.usLen;
+		memcpy(coalesce_buf, tx_buffer.ucElement, bytes_used);
+		while (xQueueReceive(*xTX_Queue, ( void * ) &tx_buffer, 0) == pdTRUE)
+		{
+			if (bytes_used + tx_buffer.usLen > (int)sizeof(coalesce_buf))
+			{
+				carried = true;
+				break;
+			}
+			memcpy(coalesce_buf + bytes_used, tx_buffer.ucElement, tx_buffer.usLen);
+			bytes_used += tx_buffer.usLen;
+		}
+
 		if( xSemaphoreTake( xTCP_Socket_Semaphore, portMAX_DELAY ) == pdTRUE )
 		{
-			int to_write = tx_buffer.usLen;
+			// While send() is stuck (wifi retries, full lwip sndbuf) the host
+			// queue is what absorbs bus traffic, so log the stall to tie it to
+			// any drops counted at the producer.
+			int64_t send_start = esp_timer_get_time();
+			int to_write = bytes_used;
 			while (to_write > 0)
 			{
-				int written = send(sock, tx_buffer.ucElement + (tx_buffer.usLen - to_write), to_write, 0);
+				int written = send(sock, coalesce_buf + (bytes_used - to_write), to_write, 0);
 				if (written < 0)
 				{
 					ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
@@ -209,6 +242,12 @@ static void tcp_server_tx_task(void *pvParameters)
 					break;
 				}
 				to_write -= written;
+			}
+			int64_t send_us = esp_timer_get_time() - send_start;
+			if (send_us > 20000)
+			{
+				ESP_LOGW(TAG, "send() stalled %lld us, %u msgs queued behind it",
+						 send_us, (unsigned)uxQueueMessagesWaiting(*xTX_Queue));
 			}
 			xSemaphoreGive( xTCP_Socket_Semaphore );
 		}
