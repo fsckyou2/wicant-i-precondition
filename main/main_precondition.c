@@ -43,6 +43,7 @@
 #include "can_manager.h"
 #include "dev_status_manager.h"
 #include "settings_manager.h"
+#include "sleep_manager.h"
 
 #include "beep.h"
 #include "can.h"
@@ -495,6 +496,10 @@ esp_err_t main_precondition_start(void)
        writer */
     beep_init();
     precondition_init();
+
+    /* the old firmware's car-off sleep: while the car is READY (0x038),
+       a 12 V under the sleep voltage doesn't put the WiCAN to sleep */
+    (void)sleep_manager_set_vehicle_on_cb(car_in_ready);
 
     const esp_timer_create_args_t timer_args =
     {

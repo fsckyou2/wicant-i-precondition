@@ -20,5 +20,6 @@ esp_err_t main_precondition_can_defaults(void);
 esp_err_t main_precondition_register_http(void);
 
 /** Starts the tasks. AFTER can_manager_start; the frame task subscribes to
- *  the bus once it is up, and again whenever the subscription is lost. */
+ *  the bus once it is up, and again whenever the subscription is lost. Also
+ *  holds sleep off while the car is READY. */
 esp_err_t main_precondition_start(void);
