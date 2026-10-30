@@ -561,7 +561,7 @@ static void adc_task(void *pvParameters)
                                 // can busses up in sleep.
 				// Sleep is the one thing allowed to take MITM forwarding
 				// down; waking is a restart, which locks it again
-				can_park();
+				can_park(false);
 				wifi_network_deinit();
 				ble_disable();
 				esp_sleep_enable_timer_wakeup(2*1000000);

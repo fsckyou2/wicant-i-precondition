@@ -62,8 +62,22 @@ void can_disable(can_bus_t bus);
 // down is brought back. Until can_park().
 void can_lock_bridge(void);
 // Sleep: takes every bus down and unlocks MITM forwarding. No bus comes back
-// up until the board wakes, which is a restart.
-void can_park(void);
+// up until the board wakes, which is a restart. With wake_on_bus, traffic on
+// either bus then wakes the chip from light sleep (bus 1 only on the EB-FD's
+// MCP2518FD); see can_woke_on_traffic().
+void can_park(bool wake_on_bus);
+// Whether a bus taken down, by recovery too, stays able to wake the board
+// (the EB-FD's MCP2518FD; nothing on other boards). can_park(true) sets it;
+// setting it early covers a bus recovery has down when sleep comes.
+void can_set_bus_wake(bool enable);
+// After a GPIO wake from light sleep, or a light sleep refused because a wake
+// pin was already low: whether bus traffic did it. False for bus 0's RX pin
+// held low for 1 ms, a bus stuck dominant that carries no traffic: that pin
+// then stops waking the board until it reads high again.
+bool can_woke_on_traffic(void);
+// Frames received on every bus since boot, queued or dropped: tells a quiet
+// bus from a live one
+uint32_t can_rx_frame_count(void);
 // So clients can tell a refused change from one that took
 bool can_bridge_locked(void);
 // MITM forwarding: whether to bridge a received frame to the other bus. False
