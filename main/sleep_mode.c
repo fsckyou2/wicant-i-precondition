@@ -347,6 +347,28 @@ esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
 #define SLEEP_STATE			2
 #define WAKEUP_STATE		3
 
+// Without this, light sleep keeps the CPU powered: IDF only sets up the CPU's
+// retention memory from esp_pm_configure(), which we don't use. ~650 uA on
+// the S3 (esp_pm Kconfig), for ~13 KB of internal RAM with the cache tags.
+// Taken at the first sleep, not at boot, and never freed: waking is a
+// restart. If it fails, sleep goes on with the CPU powered.
+static void sleep_cpu_power_down_once(void)
+{
+#if ESP_SLEEP_POWER_DOWN_CPU
+	static bool tried = false;
+
+	if(!tried)
+	{
+		tried = true;
+		esp_err_t err = esp_sleep_cpu_retention_init();
+		if(err != ESP_OK)
+		{
+			ESP_LOGE(TAG, "the CPU stays powered in sleep: %s", esp_err_to_name(err));
+		}
+	}
+#endif
+}
+
 static void adc_task(void *pvParameters)
 {
     esp_err_t ret;
@@ -355,6 +377,7 @@ static void adc_task(void *pvParameters)
     static int64_t wakeup_detect_time = 0;
     static int64_t pub_time = 0;
     static float alert_voltage = 0;
+    static bool radios_off = false;
     static uint64_t alert_time;
 	uint64_t sleep_time = 0;
     alert_time = config_server_get_alert_time();
@@ -516,6 +539,8 @@ static void adc_task(void *pvParameters)
 							{
 								pub_time = esp_timer_get_time();
 								wifi_network_init(config_server_get_alert_ssid(), config_server_get_alert_pass());
+								// Down again below only if it connects
+								radios_off = false;
 								vTaskDelay(1000 / portTICK_PERIOD_MS);
 								uint8_t count = 0;
 								while(!wifi_network_is_connected())
@@ -585,9 +610,23 @@ static void adc_task(void *pvParameters)
 				// Sleep is the one thing allowed to take MITM forwarding
 				// down; waking is a restart, which locks it again
 				can_park(bus_sleep);
-				wifi_network_deinit();
+				// Wi-Fi only when something turned it on (the battery
+				// alert): wifi_network_deinit() waits, with no timeout, for
+				// a connect attempt to end, and one started after an
+				// earlier call's Wi-Fi stop never does. BLE every time: an
+				// AP client leaving can turn it back on, and a repeat call
+				// returns at once.
+				if(!radios_off)
+				{
+					wifi_network_deinit();
+					radios_off = true;
+				}
 				ble_disable();
-				esp_sleep_enable_timer_wakeup(2*1000000);
+				if(bus_sleep)
+				{
+					sleep_cpu_power_down_once();
+				}
+				esp_sleep_enable_timer_wakeup(sleep_policy_timer_us(bus_sleep, can_wake_stuck()));
 				esp_err_t slept = esp_light_sleep_start();
 				// Bus traffic wakes the board at once: the head unit needs
 				// the car now (Bluelink), and with nobody acknowledging its
